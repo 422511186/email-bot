@@ -32,18 +32,23 @@ func ForwardEmail(smtpCfg config.SMTPConfig, email FetchedEmail, targets []strin
 	return smtp.SendMail(addr, auth, smtpCfg.From, targets, body)
 }
 
-// prependResentHeaders 在原始邮件正文前插入 RFC-2822 Resent-* 头。
+// prependResentHeaders 在原始邮件前插入 RFC-2822 Resent-* 头。
 // 这是转发邮件时保留原始头部的标准方式。
+// 注意：原始邮件已经包含完整的头部和正文（以 \r\n\r\n 分隔）
 func prependResentHeaders(from string, targets []string, original []byte) []byte {
+	// 确保 Resent-* 头在原始邮件头部之前，符合 RFC 5322 规范
+	// Resent headers should appear BEFORE original headers
+	// 使用角括号包裹发件人地址，符合 RFC 5322 addr-spec 格式
 	header := fmt.Sprintf(
 		"Resent-From: <%s>\r\nResent-To: %s\r\nResent-Date: %s\r\nX-Forwarded-By: email-bot\r\n",
 		from,
 		strings.Join(targets, ", "),
 		time.Now().Format("Mon, 02 Jan 2006 15:04:05 -0700"),
 	)
+	
+	// 合并头部和原始邮件
 	out := make([]byte, 0, len(header)+len(original))
 	out = append(out, []byte(header)...)
-	out = append(out, '\r', '\n') // 添加空行分隔符
 	out = append(out, original...)
 	return out
 }
