@@ -1,0 +1,80 @@
+# ─────────────────────────────────────────────────────────────────
+#  Email-Bot  /  config.yaml.example
+#  复制到 config.yaml 并填写你的凭据信息。
+# ─────────────────────────────────────────────────────────────────
+
+# 轮询每个源邮箱的间隔秒数。
+poll_interval: 120
+
+# ── 源邮箱（IMAP）───────────────────────────────────────────────
+#
+#  每个条目是一个要监控的账户。
+#  • 一对多  → 一个源，多个目标
+#  • 多对多 → 多个源，每个源有独立的目标列表
+#
+sources:
+
+  # ── 示例 1: Gmail → 两个目标（一对多）───────────────────────
+  - name:     "工作邮箱 Gmail"
+    host:     imap.gmail.com
+    port:     993          # 993 = 隐式 TLS（推荐）
+    username: you@gmail.com
+    password: "xxxx xxxx xxxx xxxx"   # Gmail 应用密码（16 位）
+    mailbox:  INBOX
+    targets:
+      - archive@company.com
+      - notifications@company.com
+
+  # ── 示例 2: QQ 邮箱 → 单个目标 ──────────────────────────────
+  - name:     "QQ 邮箱"
+    host:     imap.qq.com
+    port:     993
+    username: 123456789@qq.com
+    password: "你的 QQ 授权码"     # QQ 授权码
+    mailbox:  INBOX
+    targets:
+      - personal-archive@example.com
+
+  # ── 示例 3: Outlook → 多个目标 ────────────────────────────────
+  - name:     "Outlook"
+    host:     outlook.office365.com
+    port:     993
+    username: you@outlook.com
+    password: "你的应用密码"
+    mailbox:  INBOX
+    targets:
+      - team@company.com
+      - logs@company.com
+      - personal@example.com
+
+# ── 发送 SMTP（用于发送转发的邮件）─────────────────────────────
+#
+#  可以使用任何你拥有凭据的 SMTP 服务器。
+#  "from" 地址将作为信封发件人显示。
+#
+smtp:
+  host:     smtp.gmail.com
+  port:     587            # 587 = STARTTLS  |  465 = 隐式 SSL
+  username: sender@gmail.com
+  password: "xxxx xxxx xxxx xxxx"
+  from:     sender@gmail.com
+
+# ── 状态文件 ───────────────────────────────────────────────────
+#  追踪每个邮箱的最后已见 UID，以便只转发新邮件。
+#  默认为 ~/.email-bot/state.json
+#
+# state_file: /自定义路径/state.json
+
+# ─────────────────────────────────────────────────────────────────
+#  常用 IMAP 主机参考：
+#
+#  Gmail          imap.gmail.com      端口 993
+#  Outlook/Office outlook.office365.com 端口 993
+#  Yahoo          imap.mail.yahoo.com 端口 993
+#  QQ 邮箱        imap.qq.com         端口 993
+#  163 邮箱       imap.163.com        端口 993
+#  126 邮箱       imap.126.com        端口 993
+#  新浪邮箱       imap.sina.com       端口 993
+#  iCloud         imap.mail.me.com   端口 993
+#  Fastmail       imap.fastmail.com  端口 993
+# ─────────────────────────────────────────────────────────────────

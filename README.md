@@ -1,143 +1,192 @@
-# 🤖 Email Bot
+# 📧 Email Bot
 
-Email Bot 是一个使用 Go 语言编写的轻量级、跨平台的邮件增量拉取与自动转发工具。它采用了 **守护进程 (Daemon)** + **终端图形界面 (TUI)** 的分离架构设计。支持复杂的路由规则、中文字符集解码，并能通过高颜值的终端界面实时监控运行状态。
+一个使用 Go 语言编写的终端邮件转发机器人。
+轮询多个 IMAP 邮箱，增量获取新邮件，并将其转发到一个或多个目标地址 —— 全部通过实时 TUI 仪表板展示。
 
----
-
-## ✨ 核心特性
-
-- **🚀 增量拉取与状态记忆**：内核使用 IMAP 协议定时轮询，拉取新邮件后会将每个邮箱已处理的最高 UID 原子性写入本地 `state.json` 中。即使程序重启或崩溃，也能从断点处继续拉取，彻底避免重复转发。
-- **🔀 灵活的路由规则 (多对多 / 一对多)**：支持通过 YAML 配置文件设定 `rules` 列表，轻松实现将多个邮箱的新邮件汇总到一个邮箱，或者将一个邮箱的新邮件群发给多个目标邮箱。
-- **🇨🇳 完美的中文兼容**：内置对早期国内邮件系统常有的 GBK/GB18030/GB2312 字符集解码支持，自动将其转换为 UTF-8，彻底解决中文邮件乱码问题。
-- **💻 现代化 TUI 面板**：提供基于 `bubbletea` 的高颜值实时监控终端面板，支持全角中文字符对齐。
-- **🛠️ 跨平台编译**：提供一键构建脚本，支持 Windows、Linux 以及 macOS (包含 M 系列芯片和 Intel 芯片)。
-
----
-
-## 📦 快速开始
-
-### 1. 编译安装
-
-确保你的系统已安装 [Go (1.20+)](https://golang.org/dl/)，然后在项目根目录运行：
-
-```bash
-make
+```
+╭─ Email Bot ─────────────────────────── ● 运行中 | 下次轮询 47s | 10:32:15 ─╮
+│ ╭─ 邮箱列表 ─────────────────────╮ ╭─ 活动日志 ──────────────────────────╮ │
+│ │ 邮箱列表                        │ │ 活动日志                            │ │
+│ │                                │ │                                     │ │
+│ │ ✓ 工作邮箱 Gmail                │ │ 10:31:28 🚀 邮件机器人已启动         │ │
+│ │   上次: 10:31:28  已转发: 3    │ │ 10:31:28 🔄 开始轮询周期…           │ │
+│ │   → 目标数: 2 个:               │ │ 10:31:29 📬 正在轮询工作邮箱 Gmail…    │ │
+│ │     archive@co.com              │ │ 10:31:31 ✉️  "Hello team" → arch@… │ │
+│ │     notify@co.com               │ │ 10:31:31 ✅ 轮询周期完成              │ │
+│ │                                │ │ 10:31:31 💤 QQ 邮箱: 无新邮件         │ │
+│ │ ✓ QQ 邮箱                       │ │                                     │ │
+│ │   上次: 10:31:30  已转发: 0    │ │                                     │ │
+│ ╰─────────────────────────────────╯ ╰─────────────────────────────────────────╯ │
+│──────────────────────────────────────────────────────────────────────────────────│
+│  q 退出  r 立即轮询  ↑↓/j/k 选择邮箱  PgUp/PgDn 滚动日志  g/G 顶部/底部          │
+╰──────────────────────────────────────────────────────────────────────────────────╯
 ```
 
-编译完成后，你会在 `build/` 目录下看到针对不同平台的二进制可执行文件：
-- `email-bot.exe` (Windows amd64)
-- `email-bot-linux` (Linux amd64)
-- `email-bot-mac-intel` (macOS amd64)
-- `email-bot-mac-m1` (macOS arm64)
+---
 
-> ⚠️ **系统兼容性**：预编译的 Linux 二进制文件依赖于 `GLIBC_2.34`。如果运行时报错 `version 'GLIBC_2.34' not found`，请使用 `go build` 重新编译：
-> ```bash
-> go build -o build/email-bot-linux ./main.go
-> ```
+## 功能特性
 
-### 2. 配置文件说明
+- **增量拉取** — 追踪每个邮箱的已见最大 IMAP UID；仅获取新邮件
+- **首次运行保护** — 首次启动时记录当前邮箱状态，不转发历史邮件
+- **一对多** — 一个源邮箱 → 多个目标地址
+- **多对多** — 多个源邮箱，每个可配置独立的目标列表
+- **SMTP 传输** — 支持 STARTTLS（587 端口）和隐式 TLS/SSL（465 端口）
+- **持久化状态** — 重启后状态保留（`~/.email-bot/state.json`）
+- **实时 TUI** — 双面板仪表板：左侧邮箱状态，右侧可滚动活动日志
+- **跨平台** — Windows、Linux (amd64/arm64)、macOS (Intel + M系列) 单二进制
 
-在运行前，需要配置邮箱的账号和路由规则。项目中提供了一个示例配置文件 `config.example.yaml`。你可以将其复制并重命名为 `config.yaml`。
+---
 
-配置项详解：
+## 快速开始
+
+### 1. 前置要求
+
+```bash
+# Go 1.21 或更高版本
+go version
+```
+
+### 2. 克隆并安装依赖
+
+```bash
+git clone https://github.com/yourname/email-bot.git
+cd email-bot
+make deps
+```
+
+### 3. 配置
+
+```bash
+make init-config       # 将 config.yaml.example → config.yaml
+$EDITOR config.yaml    # 填写你的 IMAP/SMTP 凭据
+```
+
+### 4. 运行
+
+```bash
+make run
+# 或
+go run . -config config.yaml
+```
+
+### 5. 构建发布版本
+
+```bash
+make build             # 当前平台
+make build-all         # 所有平台 → dist/
+```
+
+---
+
+## 配置说明
+
+`config.yaml`（完整注释示例见 `config.yaml.example`）：
 
 ```yaml
-# 全局轮询间隔时间 (例如: 60s, 5m, 1h)
-poll_interval: 60s
+poll_interval: 120   # 轮询间隔秒数
 
-# Daemon 的内部 HTTP API 监听地址，供 TUI 客户端调用
-api:
-  address: "127.0.0.1:8080"
-
-# 需要监听并拉取邮件的源邮箱列表
 sources:
-  - id: "source1"                  # 唯一标识符
-    host: "imap.qq.com:993"        # IMAP 服务器地址及端口
-    username: "user@qq.com"        # 邮箱账号
-    password: "your-auth-code"     # IMAP 授权码 (通常不是登录密码)
-  - id: "source2"
-    host: "imap.163.com:993"
-    username: "user@163.com"
-    password: "your-auth-code"
-
-# 目标邮箱列表（用于发送转发邮件的 SMTP 服务器及账号）
-targets:
-  - id: "target1"
-    host: "smtp.qq.com:465"        # SMTP 服务器地址及端口
-    username: "forward@qq.com"     # 发信账号
-    password: "your-auth-code"     # SMTP 授权码
-    email: "forward@qq.com"        # 实际的 "发件人" 邮箱地址
-  - id: "target2"
-    host: "smtp.gmail.com:465"
-    username: "forward@gmail.com"
-    password: "your-auth-code"
-    email: "forward@gmail.com"
-
-# 转发路由规则
-rules:
-  # 规则 1：将 source1 收到的新邮件，同时转发给 target1 和 target2（一对多）
-  - id: "rule1"
-    sources:
-      - "source1"
+  # 一对多：一个收件箱 → 两个目标
+  - name:     "工作邮箱 Gmail"
+    host:     imap.gmail.com
+    port:     993
+    username: you@gmail.com
+    password: "应用密码"
     targets:
-      - "target1"
-      - "target2"
-  
-  # 规则 2：将 source1 和 source2 的新邮件，统一汇总转发给 target1（多对一 / 多对多）
-  - id: "rule2"
-    sources:
-      - "source1"
-      - "source2"
+      - archive@company.com
+      - notifications@company.com
+
+  # 多对多配置的一部分
+  - name:     "QQ 邮箱"
+    host:     imap.qq.com
+    port:     993
+    username: 12345@qq.com
+    password: "QQ 授权码"
     targets:
-      - "target1"
+      - personal@example.com
+
+smtp:
+  host:     smtp.gmail.com
+  port:     587          # 587 = STARTTLS，465 = SSL
+  username: sender@gmail.com
+  password: "应用密码"
+  from:     sender@gmail.com
 ```
 
-> **注意：** 出于安全考虑，主流邮箱（如 QQ、网易、Gmail）均要求使用**独立授权码**而非网页登录密码进行 IMAP/SMTP 访问，请在各邮箱的网页端设置中生成并获取。
+### Gmail 配置
 
-### 3. 运行守护进程 (Daemon)
+1. 在 Gmail 设置中启用 IMAP：查看所有设置 → 转发和 POP/IMAP
+2. 创建应用密码：Google 账户 → 安全性 → 两步验证 → 应用密码
+3. 使用 16 位应用密码作为 `password`
 
-Daemon 模式是程序的核心，它在后台运行，负责实际的邮件收取、解析、状态记录和转发。
+### QQ 邮箱配置
+
+1. 登录 QQ 邮箱 → 设置 → 账户 → 开启 IMAP/SMTP 服务
+2. 获取授权码，填写到 `password` 字段
+
+---
+
+## TUI 操作说明
+
+| 按键 | 功能 |
+|-----|------|
+| `q` / `Ctrl+C` | 退出程序 |
+| `r` | 立即触发轮询 |
+| `↑` / `k` | 选择上一个邮箱 |
+| `↓` / `j` | 选择下一个邮箱 |
+| `Tab` | 切换焦点（邮箱列表 ↔ 日志） |
+| `PgUp` / `u` | 日志向上滚动 |
+| `PgDn` / `d` | 日志向下滚动 |
+| `g` | 跳转到日志顶部 |
+| `G` | 跳转到日志底部 |
+
+---
+
+## 架构设计
+
+```
+email-bot/
+├── main.go              # 命令行入口
+├── config/
+│   └── config.go        # YAML 配置加载与验证
+├── core/
+│   ├── bot.go           # 调度器、事件总线、并发控制
+│   ├── fetcher.go       # IMAP 增量获取（go-imap v1）
+│   ├── forwarder.go     # SMTP 转发（STARTTLS / SSL）
+│   └── state.go         # 持久化 UID 高水位标记（JSON）
+└── tui/
+    └── app.go           # Bubbletea TUI（双面板布局）
+```
+
+### 事件流程
+
+```
+Bot.Run()
+  └─ 每隔 poll_interval 秒:
+       ├─ pollSource(src1)  ─┐  并发 goroutine
+       ├─ pollSource(src2)  ─┤
+       └─ pollSource(srcN)  ─┘
+            │
+            ├─ FetchNewEmails() → IMAP UID 搜索 + RFC-822 下载
+            └─ ForwardEmail()   → SMTP 发送（带 Resent-* 头）
+                    │
+                    └─► Bot.events chan ──► TUI.Update()
+```
+
+---
+
+## 跨平台构建
 
 ```bash
-# 以 Linux 平台为例，指定配置文件路径启动
-./build/email-bot-linux daemon -c config.yaml
+make build-windows-amd64   # → dist/email-bot-windows-amd64.exe
+make build-linux-amd64     # → dist/email-bot-linux-amd64
+make build-linux-arm64     # → dist/email-bot-linux-arm64
+make build-darwin-amd64    # → dist/email-bot-darwin-amd64   (Intel Mac)
+make build-darwin-arm64    # → dist/email-bot-darwin-arm64   (Apple M1/M2/M3)
 ```
 
-*可选参数：*
-- `-c, --config`: 指定 YAML 配置文件路径（默认为 `config.yaml`）
-- `-s, --state`: 指定本地状态 JSON 文件路径（默认为 `state.json`，程序会自动创建和更新）
-
-### 4. 启动 TUI 监控面板
-
-在 Daemon 正常运行后，你可以随时在另一个终端窗口启动 TUI 客户端。TUI 客户端会通过本地 HTTP 接口获取 Daemon 的实时状态和运行日志。
-
-```bash
-./build/email-bot-linux tui -a 127.0.0.1:8080
-```
-
-*快捷键：*
-- 按 `q` 或 `Ctrl+C` 退出 TUI 面板。退出 TUI **不会**影响后台 Daemon 进程的运行。
-
 ---
 
-## 🏗️ 架构与工作原理
+## 开源协议
 
-1. **分离架构**：程序分为 `daemon` (服务端) 和 `tui` (客户端) 两个子命令。`daemon` 进程暴露了一个轻量级的 HTTP REST API (`/api/status`, `/api/logs`) 供客户端查询。
-2. **增量拉取 (UID)**：IMAP 协议为每封邮件分配了唯一的 UID。程序首次运行时，如果没有历史记录，默认会拉取收件箱中最新的邮件并记录最高 UID；之后的每一次轮询，都会使用 `UID SEARCH` 指令查找大于记录 UID 的新邮件，从而实现精准的增量拉取。
-3. **中文解码处理**：通过引入 `golang.org/x/text/encoding/simplifiedchinese` 并在 `go-message` 中注册自定义的字符集处理器，Email Bot 可以无缝兼容并解析包含 `GBK` 或 `GB18030` 编码的国内老式邮件，并在转发时将其统一转换为标准的 `UTF-8` 编码。
-
----
-
-## 📚 技术栈
-
-- [Cobra](https://github.com/spf13/cobra) - 强大的现代 CLI 命令行应用构建框架
-- [BubbleTea](https://github.com/charmbracelet/bubbletea) - 流行的 Elm 架构 TUI (Terminal User Interface) 框架
-- [go-imap](https://github.com/emersion/go-imap) - IMAP 客户端库，处理邮件拉取
-- [gomail.v2](https://gopkg.in/gomail.v2) - SMTP 客户端库，处理邮件发送
-- [go-message](https://github.com/emersion/go-message) - 用于解析复杂的 MIME 邮件结构和字符集
-
----
-
-## 📜 许可证
-
-本项目基于 MIT License 开源。
+MIT
