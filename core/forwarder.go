@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net/smtp"
+	"strings"
 
 	"email-bot/config"
 
@@ -22,7 +23,7 @@ func ForwardEmail(smtpCfg config.SMTPConfig, email FetchedEmail, targets []strin
 		return fmt.Errorf("未提供目标地址")
 	}
 
-	body := prependResentHeaders(smtpCfg.From, targets, email.Raw)
+	body := prependResentHeaders(smtpCfg.From, email.From, email.Raw)
 	addr := fmt.Sprintf("%s:%d", smtpCfg.Host, smtpCfg.Port)
 	auth := smtp.PlainAuth("", smtpCfg.Username, smtpCfg.Password, smtpCfg.Host)
 
@@ -33,16 +34,39 @@ func ForwardEmail(smtpCfg config.SMTPConfig, email FetchedEmail, targets []strin
 	return smtp.SendMail(addr, auth, smtpCfg.From, targets, body)
 }
 
-func prependResentHeaders(from string, targets []string, original []byte) []byte {
+func prependResentHeaders(from, originalFrom string, original []byte) []byte {
+	displayName := originalFrom
+	if idx := strings.Index(originalFrom, "<"); idx >= 0 {
+		displayName = strings.TrimSpace(originalFrom[idx+1:])
+		if idx := strings.Index(displayName, ">"); idx >= 0 {
+			displayName = displayName[:idx]
+		}
+	}
+
 	header := fmt.Sprintf(
 		"From: <%s>\r\nX-Forwarded-By: email-bot\r\n",
 		from,
 	)
 
-	out := make([]byte, 0, len(header)+len(original))
+	prefix := fmt.Sprintf("[%s] - ", displayName)
+	modified := modifySubject(original, prefix)
+
+	out := make([]byte, 0, len(header)+len(modified))
 	out = append(out, []byte(header)...)
-	out = append(out, original...)
+	out = append(out, modified...)
 	return out
+}
+
+func modifySubject(original []byte, prefix string) []byte {
+	s := string(original)
+	lines := strings.Split(s, "\r\n")
+	for i, line := range lines {
+		if strings.HasPrefix(strings.ToLower(line), "subject:") {
+			lines[i] = line[:8] + prefix + strings.TrimLeft(line[8:], " \t")
+			break
+		}
+	}
+	return []byte(strings.Join(lines, "\r\n"))
 }
 
 func sendMailImplicitTLS(addr, host string, auth smtp.Auth, from string, to []string, body []byte) error {
