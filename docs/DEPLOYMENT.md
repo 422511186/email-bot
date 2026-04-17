@@ -25,7 +25,7 @@
 
 ```bash
 # 克隆仓库
-git clone https://github.com/yourname/email-bot.git
+git clone https://github.com/422511186/email-bot.git
 cd email-bot
 
 # 安装依赖

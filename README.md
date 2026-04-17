@@ -56,7 +56,7 @@ go version
 
 ```bash
 # 克隆仓库
-git clone https://github.com/yourname/email-bot.git
+git clone https://github.com/422511186/email-bot.git
 cd email-bot
 
 # 安装依赖
@@ -68,7 +68,7 @@ make build
 
 #### 方式二：下载预编译二进制
 
-从 [Releases](https://github.com/yourname/email-bot/releases) 下载对应平台的压缩包。
+从 [Releases](https://github.com/422511186/email-bot/releases) 下载对应平台的压缩包。
 
 ### 配置
 
