@@ -105,10 +105,20 @@ func findMaxUID(c *client.Client) (uint32, error) {
 // searchUIDs 返回所有严格大于 lastUID 的 UID。
 func searchUIDs(c *client.Client, lastUID uint32) ([]uint32, error) {
 	set := new(imap.SeqSet)
-	set.AddRange(lastUID+1, 0) // lastUID+1:*
+	set.AddRange(1, 0)
 	criteria := imap.NewSearchCriteria()
 	criteria.Uid = set
-	return c.UidSearch(criteria)
+	allUids, err := c.UidSearch(criteria)
+	if err != nil {
+		return nil, err
+	}
+	var result []uint32
+	for _, uid := range allUids {
+		if uid > lastUID {
+			result = append(result, uid)
+		}
+	}
+	return result, nil
 }
 
 // fetchMessages 下载 uids 中每个 UID 对应邮件的 RFC-822 正文。
