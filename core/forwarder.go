@@ -43,6 +43,7 @@ func prependResentHeaders(from string, targets []string, original []byte) []byte
 	)
 	out := make([]byte, 0, len(header)+len(original))
 	out = append(out, []byte(header)...)
+	out = append(out, '\r', '\n') // 添加空行分隔符
 	out = append(out, original...)
 	return out
 }
