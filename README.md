@@ -30,6 +30,11 @@ make
 - `email-bot-mac-intel` (macOS amd64)
 - `email-bot-mac-m1` (macOS arm64)
 
+> ⚠️ **系统兼容性**：预编译的 Linux 二进制文件依赖于 `GLIBC_2.34`。如果运行时报错 `version 'GLIBC_2.34' not found`，请使用 `go build` 重新编译：
+> ```bash
+> go build -o build/email-bot-linux ./main.go
+> ```
+
 ### 2. 配置文件说明
 
 在运行前，需要配置邮箱的账号和路由规则。项目中提供了一个示例配置文件 `config.example.yaml`。你可以将其复制并重命名为 `config.yaml`。
