@@ -218,7 +218,7 @@ func (b *Bot) pollSource(src config.SourceAccount) {
 
 	b.emit(EventLog, fmt.Sprintf("📨 %s: 发现 %d 封新邮件", src.Name, len(result.Emails)))
 
-	for _, email := range result.Emails {
+	for i, email := range result.Emails {
 		if err := ForwardEmail(b.cfg.SMTP, email, src.Targets); err != nil {
 			b.emit(EventLog, fmt.Sprintf(
 				"❌ 转发失败 \"%s\": %v",
@@ -234,6 +234,10 @@ func (b *Bot) pollSource(src config.SourceAccount) {
 				strings.Join(src.Targets, ", "),
 			))
 			b.emitStatus(src.Username)
+		}
+		// 邮件之间添加延迟，避免目标邮箱被识别为垃圾邮件或触发限流
+		if i < len(result.Emails)-1 && b.cfg.ForwardDelay > 0 {
+			time.Sleep(time.Duration(b.cfg.ForwardDelay) * time.Millisecond)
 		}
 	}
 }

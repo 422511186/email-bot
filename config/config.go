@@ -30,7 +30,8 @@ type SMTPConfig struct {
 
 // Config 是根配置结构。
 type Config struct {
-	PollInterval int             `yaml:"poll_interval"` // 轮询间隔秒数，默认 60
+	PollInterval int             `yaml:"poll_interval"`  // 轮询间隔秒数，默认 60
+	ForwardDelay int             `yaml:"forward_delay"`  // 转发邮件间隔（毫秒），默认 1000
 	Sources      []SourceAccount `yaml:"sources"`
 	SMTP         SMTPConfig      `yaml:"smtp"`
 	StateFile    string          `yaml:"state_file"` // 默认 ~/.email-bot/state.json
@@ -45,6 +46,7 @@ func Load(path string) (*Config, error) {
 
 	cfg := &Config{
 		PollInterval: 60,
+		ForwardDelay: 1000,
 	}
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("解析配置: %w", err)
