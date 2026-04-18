@@ -1,0 +1,42 @@
+name: Build and Test
+
+on:
+  push:
+    branches: [ "main", "master", "develop" ]
+  pull_request:
+    branches: [ "main", "master", "develop" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.25.x'
+        cache: true
+
+    - name: Install dependencies
+      run: make deps
+
+    - name: Run lint
+      run: make lint
+
+    - name: Run tests
+      run: make test
+
+    - name: Build cross-platform binaries
+      run: make build-all
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: email-bot-binaries
+        path: dist/
+        retention-days: 7

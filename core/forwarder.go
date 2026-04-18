@@ -28,7 +28,7 @@ type SMTPForwarder struct {
 }
 
 func NewSMTPForwarder(cfg config.SMTPConfig) (*SMTPForwarder, error) {
-	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+	addr := net.JoinHostPort(cfg.Host, fmt.Sprintf("%d", cfg.Port))
 	dialer := &net.Dialer{Timeout: 30 * time.Second}
 
 	var conn net.Conn
