@@ -38,14 +38,20 @@ Email Bot 是一个使用 Go 语言编写的终端邮件转发机器人。它通
 ### 4.2 核心调度 (`core` 包)
 - **[Bot](file:///workspace/core/bot.go#L44-L54)**：核心调度器，维护配置、状态、事件通道（`events`）以及各邮箱当前状态的并发安全映射。
 - **[Bot.Run()](file:///workspace/core/bot.go#L121-L142)**：阻塞的无限循环函数，根据定时器或手动触发信号（`pollNow`）执行 `runPollCycle()`。
-- **[Bot.pollSource()](file:///workspace/core/bot.go#L164-L243)**：处理单一邮箱的具体流程：获取最新邮件 -> 逐封转发 -> 更新内存及事件日志。
+- **[Bot.pollSource()](file:///workspace/core/bot.go#L164-L243)**：处理单一邮箱的具体流程：获取最新邮件 -> 创建单例 `SMTPForwarder` 实例 -> 复用连接逐封转发 -> 更新内存及事件日志。
 
 ### 4.3 邮件获取与转发 (`core` 包)
 - **[FetchNewEmails()](file:///workspace/core/fetcher.go#L37-L85)**：
-  - 连接 IMAP 服务器，如果是首次初始化则调用 `findMaxUID` 获取最高水位并返回；否则调用 `searchUIDs` 获取新 UID 并通过 `fetchMessages` 下载 RFC-822 原文。
+  - 连接 IMAP 服务器（附带 `30s` 拨号超时保护），如果是首次初始化则调用 `findMaxUID` 获取最高水位并返回；否则调用 `searchUIDs` 获取新 UID 并通过 `fetchMessages` 下载 RFC-822 原文。
 - **[FetchedEmail](file:///workspace/core/fetcher.go#L16-L22)**：承载单封邮件元数据与原始数据的结构体。
-- **[ForwardEmail()](file:///workspace/core/forwarder.go#L21-L35)**：
-  - 通过 SMTP 协议发送邮件。根据端口判断使用 STARTTLS (`smtp.SendMail`) 还是隐式 TLS (`sendMailImplicitTLS`)。
+- **[SMTPForwarder](file:///workspace/core/forwarder.go#L22-L25)**：
+  - 核心发送器结构体，负责维护可复用的 SMTP TCP/TLS 底层连接。
+- **[NewSMTPForwarder()](file:///workspace/core/forwarder.go#L27-L69)**：
+  - 初始化 `SMTPForwarder` 实例，提供网络超时控制，并处理 465 隐式 TLS 及 587 STARTTLS 认证。
+- **[SMTPForwarder.ForwardEmail()](file:///workspace/core/forwarder.go#L71-L93)**：
+  - 复用建立的连接发送一封邮件，内部调用 `prependResentHeaders` 进行信封和 Header 修改。
+- **[modifySubject()](file:///workspace/core/forwarder.go#L123-L166)**：
+  - 智能提取原始 Header 并在保证安全（MIME 解码和二次重新编码）的前提下，向原主题注入如 `[发送者] - ` 的前缀，杜绝 Base64 和 Quoted-Printable 造成的乱码问题。
 
 ### 4.4 状态持久化 (`core` 包)
 - **[State](file:///workspace/core/state.go#L17-L21)**：包含 `Sources` 映射，记录每个账号的 `LastUID` 和 `Initialized` 标志。

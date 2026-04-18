@@ -86,14 +86,17 @@ Fetcher
 
 ```
 Forwarder
-├── ForwardEmail()    # 发送邮件
-├── prependResentHeaders()  # 添加 Resent-* 头
-└── sendMailImplicitTLS()   # 隐式 TLS 发送
+├── SMTPForwarder           # SMTP 客户端连接封装
+├── ForwardEmail()          # 复用连接，发送单封邮件
+├── prependResentHeaders()  # 添加 Resent-* 头，修改 Subject
+└── modifySubject()         # MIME 主题智能解码、追加前缀、重新编码
 ```
 
 **职责**：
-- SMTP 连接管理
-- 邮件转发（保留原始内容）
+- SMTP 拨号与认证（带 30 秒超时控制）
+- **SMTP 连接复用**（一轮多封邮件共用一个底层 TLS 连接）
+- 邮件头修改（解析原邮件 Base64 标题并重新编码防止乱码）
+- 邮件转发（保留原始正文与附件）
 - 支持 STARTTLS 和 SSL
 
 #### State (`state.go`)
@@ -154,11 +157,13 @@ pollSource(src1)              pollSource(srcN)
   │                                     │
   ▼                                     ▼
 FetchNewEmails()              FetchNewEmails()
-  │                                     │
-  ├─────────────────────────────────────┤
+  │
+  ├─────────────────────────────────────┐
+  │  创建单例 SMTPForwarder 连接        │
+  │  (若连接失败或超时 30s 则中断)      │
   │                                     │
   ▼                                     ▼
-ForwardEmail() ──────────▶ SMTP Server
+SMTPForwarder.ForwardEmail()  (复用此连接)
   │                                     │
   └─────────────────────────────────────┘
                     │
