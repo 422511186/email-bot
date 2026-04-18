@@ -48,6 +48,7 @@ type Bot struct {
 	events   chan Event
 	stopCh   chan struct{}
 	pollNow  chan struct{}
+	wg       sync.WaitGroup
 	mu       sync.RWMutex
 	statuses map[string]*MailboxStatus // 以 Username 为键
 	nextPoll time.Time
@@ -113,13 +114,17 @@ func (b *Bot) TriggerPoll() {
 	}
 }
 
-// Stop 信号通知机器人正常关闭。
+// Stop 信号通知机器人正常关闭，并等待当前处理中的轮询完成。
 func (b *Bot) Stop() {
 	close(b.stopCh)
+	b.wg.Wait()
 }
 
 // Run 是机器人的主循环。在 goroutine 中调用。
 func (b *Bot) Run() {
+	b.wg.Add(1)
+	defer b.wg.Done()
+
 	b.emit(EventLog, "🚀 邮件机器人已启动 — 执行初始轮询…")
 	b.runPollCycle()
 
@@ -135,7 +140,7 @@ func (b *Bot) Run() {
 		case <-b.pollNow:
 			b.runPollCycle()
 		case <-b.stopCh:
-			b.emit(EventLog, "🛑 邮件机器人已停止")
+			b.emit(EventLog, "🛑 邮件机器人正在安全停止中...")
 			return
 		}
 	}
@@ -197,13 +202,17 @@ func (b *Bot) pollSource(src config.SourceAccount) {
 		b.mu.Lock()
 		status.LastError = err
 		b.mu.Unlock()
-		b.emit(EventLog, fmt.Sprintf("❌ %s: 获取错误 — %v", src.Name, err))
-		return
+		b.emit(EventLog, fmt.Sprintf("❌ %s: 获取时发生部分错误 — %v", src.Name, err))
+		
+		// 注意：不要直接 return！
+		// 因为 FetchNewEmails 在分批拉取时，如果遇到错误，
+		// 依然会返回在错误发生之前成功拉取到的部分邮件 (result.Emails)。
+		// 如果这里直接 return，那些成功拉取的邮件将被丢弃并在下一次轮询中重复下载。
+	} else {
+		b.mu.Lock()
+		status.LastError = nil
+		b.mu.Unlock()
 	}
-
-	b.mu.Lock()
-	status.LastError = nil
-	b.mu.Unlock()
 
 	// 首次运行初始化 — 暂无邮件需要转发
 	if !initialized {
