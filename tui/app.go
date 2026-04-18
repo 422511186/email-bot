@@ -84,6 +84,42 @@ type logLine struct {
 	msg string
 }
 
+// ── 日志环形缓冲区 ───────────────────────────────────────────────────────
+
+type logBuffer struct {
+	lines []logLine
+	head  int
+	count int
+}
+
+func newLogBuffer(capacity int) *logBuffer {
+	return &logBuffer{
+		lines: make([]logLine, capacity),
+	}
+}
+
+func (b *logBuffer) push(line logLine) {
+	b.lines[b.head] = line
+	b.head = (b.head + 1) % len(b.lines)
+	if b.count < len(b.lines) {
+		b.count++
+	}
+}
+
+func (b *logBuffer) getAll() []logLine {
+	if b.count == 0 {
+		return nil
+	}
+	out := make([]logLine, b.count)
+	if b.count < len(b.lines) {
+		copy(out, b.lines[:b.count])
+	} else {
+		copy(out, b.lines[b.head:])
+		copy(out[len(b.lines)-b.head:], b.lines[:b.head])
+	}
+	return out
+}
+
 // ── 模型 ─────────────────────────────────────────────────────────────────
 
 const (
@@ -99,7 +135,7 @@ type Model struct {
 	cfg *config.Config
 
 	statuses []*core.MailboxStatus
-	logs     []logLine
+	logs     *logBuffer
 
 	selected  int  // 左侧面板中选中的邮箱索引
 	logOffset int  // 右侧面板中的滚动偏移
@@ -115,6 +151,7 @@ func NewModel(bot *core.Bot, cfg *config.Config) Model {
 		bot:      bot,
 		cfg:      cfg,
 		statuses: bot.GetStatuses(),
+		logs:     newLogBuffer(maxLogLines),
 	}
 }
 
@@ -141,13 +178,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		e := core.Event(msg)
 		switch e.Kind {
 		case core.EventLog:
-			m.logs = append(m.logs, logLine{ts: e.Timestamp, msg: e.Message})
-			if len(m.logs) > maxLogLines {
-				m.logs = m.logs[len(m.logs)-maxLogLines:]
-			}
+			m.logs.push(logLine{ts: e.Timestamp, msg: e.Message})
 			// 如果用户没有手动向上滚动，则自动滚动到底部。
 			vh := m.logViewHeight()
-			maxOff := lenMax0(len(m.logs)-vh)
+			maxOff := lenMax0(m.logs.count - vh)
 			if m.logOffset >= maxOff-2 || m.logOffset == 0 {
 				m.logOffset = maxOff
 			}
@@ -172,7 +206,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "r", "R":
 		m.bot.TriggerPoll()
-		m.logs = append(m.logs, logLine{
+		m.logs.push(logLine{
 			ts:  time.Now(),
 			msg: "🖱️  用户触发了手动轮询",
 		})
@@ -194,11 +228,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "pgup", "u":
 		m.logOffset = imax(0, m.logOffset-m.logViewHeight())
 	case "pgdn", "d":
-		m.logOffset = imin(lenMax0(len(m.logs)-m.logViewHeight()), m.logOffset+m.logViewHeight())
+		m.logOffset = imin(lenMax0(m.logs.count-m.logViewHeight()), m.logOffset+m.logViewHeight())
 	case "g":
 		m.logOffset = 0
 	case "G":
-		m.logOffset = lenMax0(len(m.logs) - m.logViewHeight())
+		m.logOffset = lenMax0(m.logs.count - m.logViewHeight())
 	}
 
 	return m, nil
@@ -352,20 +386,22 @@ func (m Model) renderLogPanel(w, h int) string {
 		"",
 	}
 
+	allLogs := m.logs.getAll()
+
 	// 限制滚动偏移
-	maxOff := lenMax0(len(m.logs) - vh)
+	maxOff := lenMax0(len(allLogs) - vh)
 	off := imin(m.logOffset, maxOff)
 	if off < 0 {
 		off = 0
 	}
 
 	end := off + vh
-	if end > len(m.logs) {
-		end = len(m.logs)
+	if end > len(allLogs) {
+		end = len(allLogs)
 	}
-	visible := m.logs[off:end]
+	visible := allLogs[off:end]
 
-	if len(m.logs) == 0 {
+	if len(allLogs) == 0 {
 		lines = append(lines, styleMeta.Render("  等待事件…"))
 	}
 
@@ -376,8 +412,8 @@ func (m Model) renderLogPanel(w, h int) string {
 	}
 
 	// 滚动指示器
-	if len(m.logs) > vh {
-		total := len(m.logs)
+	if len(allLogs) > vh {
+		total := len(allLogs)
 		pct := 0
 		if maxOff > 0 {
 			pct = (off * 100) / maxOff

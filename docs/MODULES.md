@@ -177,44 +177,42 @@ return uids[len(uids)-1]  // 升序排列，最后是最大
 
 ## core/forwarder.go
 
-**职责**：SMTP 协议封装，邮件转发。
+**职责**：SMTP 协议封装，网络超时控制，MIME 编码解析及连接复用的邮件转发。
 
-### 关键函数
+### 关键结构与函数
 
-#### `ForwardEmail(smtpCfg config.SMTPConfig, email FetchedEmail, targets []string) error`
+#### `SMTPForwarder`
 
-转发单封邮件：
+维护长生命周期的 SMTP Client 和信封发件人信息：
 
 ```go
-// 1. 准备邮件内容（添加 Resent-* 头）
-body := prependResentHeaders(from, targets, email.Raw)
-
-// 2. 根据端口选择发送方式
-if smtpCfg.Port == 465 {
-    return sendMailImplicitTLS(...)  // 隐式 TLS
+type SMTPForwarder struct {
+    client *smtp.Client
+    from   string
 }
-return smtp.SendMail(...)  // STARTTLS (587/25)
 ```
 
-#### `prependResentHeaders(from string, targets []string, original []byte) []byte`
+#### `NewSMTPForwarder(cfg config.SMTPConfig) (*SMTPForwarder, error)`
 
-添加 RFC-2822 Resent-* 头部：
+拨号建立 SMTP 连接：
+- 内置 30 秒的 `net.Dialer` 网络拨号超时控制
+- 根据端口 (465/587) 自动处理隐式 TLS 与 STARTTLS
+- 完成身份认证
 
-```
-Resent-From: <sender@example.com>
-Resent-To: target1@example.com, target2@example.com
-Resent-Date: Mon, 01 Jan 2024 12:00:00 +0800
-X-Forwarded-By: email-bot
+#### `(f *SMTPForwarder) ForwardEmail(email FetchedEmail, targets []string) error`
 
-[原始邮件内容，包含所有附件和内联图片]
-```
+复用现有 SMTP 连接转发邮件：
+- 发送 MAIL FROM 和 RCPT TO 指令
+- 将处理后的原邮件数据（`prependResentHeaders`）写入数据流中
 
-#### `sendMailImplicitTLS(addr, host string, auth smtp.Auth, ...) error`
+#### `modifySubject(original []byte, prefix string) []byte`
 
-隐式 TLS 发送（465 端口）：
-- 建立 TLS 连接
-- 创建 SMTP 客户端
-- 认证、发送
+安全修改邮件主题（Subject）：
+- 定位并切分出 Headers 和 Body
+- 支持多行折叠 (Folding) 的 Header 合并
+- 使用 `mime.WordDecoder` 智能解码原有的 Base64/Quoted-Printable 主题
+- 将自定义前缀与原主题拼接后，再通过 `mime.BEncoding` 安全地重新编码
+- 避免破坏原邮件结构导致乱码
 
 ---
 
