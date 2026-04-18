@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"net"
 	"time"
 
 	"github.com/emersion/go-imap"
@@ -37,7 +38,8 @@ type FetchResult struct {
 func FetchNewEmails(src config.SourceAccount, lastUID uint32, initialized bool) (FetchResult, error) {
 	addr := fmt.Sprintf("%s:%d", src.Host, src.Port)
 
-	c, err := client.DialTLS(addr, nil)
+	dialer := &net.Dialer{Timeout: 30 * time.Second}
+	c, err := client.DialWithDialerTLS(dialer, addr, nil)
 	if err != nil {
 		return FetchResult{NewLastUID: lastUID}, fmt.Errorf("连接 %s: %w", addr, err)
 	}

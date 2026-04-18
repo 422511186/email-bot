@@ -218,8 +218,15 @@ func (b *Bot) pollSource(src config.SourceAccount) {
 
 	b.emit(EventLog, fmt.Sprintf("📨 %s: 发现 %d 封新邮件", src.Name, len(result.Emails)))
 
+	smtpClient, err := NewSMTPForwarder(b.cfg.SMTP)
+	if err != nil {
+		b.emit(EventLog, fmt.Sprintf("❌ SMTP 连接失败: %v", err))
+		return
+	}
+	defer smtpClient.Close()
+
 	for i, email := range result.Emails {
-		if err := ForwardEmail(b.cfg.SMTP, email, src.Targets); err != nil {
+		if err := smtpClient.ForwardEmail(email, src.Targets); err != nil {
 			b.emit(EventLog, fmt.Sprintf(
 				"❌ 转发失败 \"%s\": %v",
 				clip(email.Subject, 45), err,
