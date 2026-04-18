@@ -16,7 +16,8 @@ type sourceState struct {
 
 // State 保存所有跨重启的持久化数据。
 type State struct {
-	mu      sync.RWMutex
+	mu     sync.RWMutex
+	fileMu sync.Mutex // 专用的文件系统写锁，防止并发向同一个 tmp 文件写入导致数据错乱
 	Sources map[string]*sourceState `json:"sources"`
 }
 
@@ -46,6 +47,10 @@ func (s *State) Save(path string) error {
 	if err != nil {
 		return err
 	}
+
+	// 从这里开始进行磁盘 I/O，使用专门的文件锁，防止多个 Goroutine 并发写毁状态文件
+	s.fileMu.Lock()
+	defer s.fileMu.Unlock()
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err

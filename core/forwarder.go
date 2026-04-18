@@ -95,11 +95,14 @@ func (f *SMTPForwarder) ForwardEmail(email FetchedEmail, targets []string) error
 	if err != nil {
 		return fmt.Errorf("SMTP DATA: %w", err)
 	}
+
+	// 无论写入成功与否，必须关闭数据流，否则会导致整个 SMTP 连接处于挂起状态而死锁
+	defer func() {
+		_ = wc.Close()
+	}()
+
 	if _, err := wc.Write(body); err != nil {
 		return fmt.Errorf("SMTP 写入正文: %w", err)
-	}
-	if err := wc.Close(); err != nil {
-		return fmt.Errorf("SMTP 关闭数据流: %w", err)
 	}
 
 	return nil
@@ -196,10 +199,14 @@ func processSubject(rawLine, prefix string) string {
 	val = strings.ReplaceAll(val, "\r", "")
 	val = strings.TrimSpace(val)
 
-	dec := new(mime.WordDecoder)
+	dec := &mime.WordDecoder{
+		CharsetReader: charset.Reader,
+	}
 	decoded, err := dec.DecodeHeader(val)
 	if err != nil {
-		decoded = val // 降级处理，不解码
+		// 降级处理：如果无法解码（如格式损坏），避免再次错误编码导致彻底乱码
+		// 直接将其作为普通的 ascii 拼接前缀返回
+		return "Subject: " + prefix + val
 	}
 
 	newSubj := prefix + decoded

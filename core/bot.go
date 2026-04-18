@@ -247,6 +247,8 @@ func (b *Bot) pollSource(src config.SourceAccount) {
 	}
 	defer smtpClient.Close()
 
+	forwardFailed := false
+
 	for i, email := range result.Emails {
 		if err := smtpClient.ForwardEmail(email, src.Targets); err != nil {
 			b.emit(EventLog, fmt.Sprintf(
@@ -255,6 +257,7 @@ func (b *Bot) pollSource(src config.SourceAccount) {
 			))
 			// 如果转发失败，停止后续邮件的转发和状态更新
 			// 确保失败的邮件在下一次轮询时被重新拉取重试
+			forwardFailed = true
 			break
 		} else {
 			b.mu.Lock()
@@ -278,13 +281,15 @@ func (b *Bot) pollSource(src config.SourceAccount) {
 		}
 	}
 
-	// 当所有能成功转发的邮件都处理完毕后，如果有因为 body 损坏而被跳过的坏邮件，
-	// 它们的 UID 可能会大于最后一次成功转发的 email.UID。
-	// 这里用 result.NewLastUID 兜底推进，跨过死信，防止下一轮死循环。
-	currentSavedUID := b.state.GetLastUID(src.Username)
-	if result.NewLastUID > currentSavedUID {
-		b.state.SetLastUID(src.Username, result.NewLastUID)
-		_ = b.state.Save(b.cfg.StateFile)
+	// 仅当本批次所有邮件都成功转发（未触发 break），
+	// 且有因为 body 损坏而被跳过的坏邮件（导致 result.NewLastUID 大于最后一个成功邮件的 UID）时，
+	// 我们才使用 result.NewLastUID 兜底推进，跨过死信，防止下一轮死循环。
+	if !forwardFailed {
+		currentSavedUID := b.state.GetLastUID(src.Username)
+		if result.NewLastUID > currentSavedUID {
+			b.state.SetLastUID(src.Username, result.NewLastUID)
+			_ = b.state.Save(b.cfg.StateFile)
+		}
 	}
 }
 
