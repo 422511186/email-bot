@@ -216,11 +216,9 @@ func (b *Bot) pollSource(src config.SourceAccount) {
 
 	// 首次运行初始化 — 暂无邮件需要转发
 	if !initialized {
-		// 持久化初始高水位 UID
-		if result.NewLastUID > 0 {
-			b.state.SetLastUID(src.Username, result.NewLastUID)
-			_ = b.state.Save(b.cfg.StateFile) // 立即落盘
-		}
+		// 持久化初始高水位 UID (无论是否为空邮箱，都必须标记为已初始化)
+		b.state.SetLastUID(src.Username, result.NewLastUID)
+		_ = b.state.Save(b.cfg.StateFile) // 立即落盘
 
 		b.emit(EventLog, fmt.Sprintf(
 			"🔖 %s: 已初始化（UID 高水位 = %d，此后新邮件将被转发）",
@@ -231,6 +229,12 @@ func (b *Bot) pollSource(src config.SourceAccount) {
 
 	if len(result.Emails) == 0 {
 		b.emit(EventLog, fmt.Sprintf("💤 %s: 无新邮件", src.Name))
+		// 如果当前有遇到无法解析跳过的坏邮件（导致 Emails 为空但 maxUID 推进了）
+		// 我们也应该推进 LastUID，防止无限重试这封坏邮件
+		if result.NewLastUID > lastUID {
+			b.state.SetLastUID(src.Username, result.NewLastUID)
+			_ = b.state.Save(b.cfg.StateFile)
+		}
 		return
 	}
 
@@ -272,6 +276,15 @@ func (b *Bot) pollSource(src config.SourceAccount) {
 		if i < len(result.Emails)-1 && b.cfg.ForwardDelay > 0 {
 			time.Sleep(time.Duration(b.cfg.ForwardDelay) * time.Millisecond)
 		}
+	}
+
+	// 当所有能成功转发的邮件都处理完毕后，如果有因为 body 损坏而被跳过的坏邮件，
+	// 它们的 UID 可能会大于最后一次成功转发的 email.UID。
+	// 这里用 result.NewLastUID 兜底推进，跨过死信，防止下一轮死循环。
+	currentSavedUID := b.state.GetLastUID(src.Username)
+	if result.NewLastUID > currentSavedUID {
+		b.state.SetLastUID(src.Username, result.NewLastUID)
+		_ = b.state.Save(b.cfg.StateFile)
 	}
 }
 

@@ -1,7 +1,6 @@
 package core
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -44,6 +43,9 @@ func FetchNewEmails(src config.SourceAccount, lastUID uint32, initialized bool) 
 		return FetchResult{NewLastUID: lastUID}, fmt.Errorf("连接 %s: %w", addr, err)
 	}
 	defer func() { _ = c.Logout() }()
+
+	// 为所有后续的 IMAP 命令设置超时时间，防止因服务器假死导致整个 Goroutine 永久阻塞
+	c.Timeout = 30 * time.Second
 
 	if err := c.Login(src.Username, src.Password); err != nil {
 		return FetchResult{NewLastUID: lastUID}, fmt.Errorf("登录: %w", err)
@@ -177,7 +179,7 @@ func fetchMessages(c *client.Client, uids []uint32, currentMax uint32) ([]Fetche
 				Subject: envelopeSubject(msg),
 				From:    envelopeFrom(msg),
 				Date:    envelopeDate(msg),
-				Raw:     bytes.Clone(raw),
+				Raw:     raw,
 			})
 		}
 
@@ -201,6 +203,9 @@ func envelopeFrom(msg *imap.Message) string {
 		return ""
 	}
 	a := msg.Envelope.From[0]
+	if a == nil {
+		return ""
+	}
 	if a.PersonalName != "" {
 		return fmt.Sprintf("%s <%s@%s>", a.PersonalName, a.MailboxName, a.HostName)
 	}

@@ -83,6 +83,9 @@ func (s *State) IsInitialized(username string) bool {
 func (s *State) SetLastUID(username string, uid uint32) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.Sources == nil {
+		s.Sources = make(map[string]*sourceState)
+	}
 	if _, ok := s.Sources[username]; !ok {
 		s.Sources[username] = &sourceState{}
 	}
