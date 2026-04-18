@@ -267,6 +267,8 @@ make init-config    # 复制配置示例
 - [API 参考](docs/API.md) - 类型定义与函数接口
 - [配置指南](docs/CONFIG.md) - 配置项详解与常见邮箱配置
 - [部署指南](docs/DEPLOYMENT.md) - 安装部署与后台运行
+- [升级指南](docs/UPGRADE.md) - 源代码平滑编译与优雅升级流程
+- [Code Wiki](docs/Code_Wiki.md) - 源码架构与重构详情
 
 ---
 
