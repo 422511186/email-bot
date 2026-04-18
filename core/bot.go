@@ -145,11 +145,19 @@ func (b *Bot) Run() {
 func (b *Bot) runPollCycle() {
 	b.emit(EventLog, "🔄 开始轮询周期…")
 
+	// 限制同时并发轮询的邮箱数为 5，防止协程和连接数过多导致资源耗尽
+	const maxConcurrentSources = 5
+	sem := make(chan struct{}, maxConcurrentSources)
+
 	var wg sync.WaitGroup
 	for _, src := range b.cfg.Sources {
 		wg.Add(1)
 		go func(src config.SourceAccount) {
 			defer wg.Done()
+			
+			sem <- struct{}{}        // 获取信号量
+			defer func() { <-sem }() // 释放信号量
+			
 			b.pollSource(src)
 		}(src)
 	}
@@ -197,13 +205,14 @@ func (b *Bot) pollSource(src config.SourceAccount) {
 	status.LastError = nil
 	b.mu.Unlock()
 
-	// 持久化新的高水位 UID
-	if result.NewLastUID > 0 {
-		b.state.SetLastUID(src.Username, result.NewLastUID)
-	}
-
 	// 首次运行初始化 — 暂无邮件需要转发
 	if !initialized {
+		// 持久化初始高水位 UID
+		if result.NewLastUID > 0 {
+			b.state.SetLastUID(src.Username, result.NewLastUID)
+			_ = b.state.Save(b.cfg.StateFile) // 立即落盘
+		}
+
 		b.emit(EventLog, fmt.Sprintf(
 			"🔖 %s: 已初始化（UID 高水位 = %d，此后新邮件将被转发）",
 			src.Name, result.NewLastUID,
@@ -231,6 +240,9 @@ func (b *Bot) pollSource(src config.SourceAccount) {
 				"❌ 转发失败 \"%s\": %v",
 				clip(email.Subject, 45), err,
 			))
+			// 如果转发失败，停止后续邮件的转发和状态更新
+			// 确保失败的邮件在下一次轮询时被重新拉取重试
+			break
 		} else {
 			b.mu.Lock()
 			status.TotalFwded++
@@ -240,6 +252,11 @@ func (b *Bot) pollSource(src config.SourceAccount) {
 				clip(email.Subject, 38),
 				strings.Join(src.Targets, ", "),
 			))
+			
+			// 只有成功转发后，才更新并持久化当前邮件的 UID
+			b.state.SetLastUID(src.Username, email.UID)
+			_ = b.state.Save(b.cfg.StateFile)
+
 			b.emitStatus(src.Username)
 		}
 		// 邮件之间添加延迟，避免目标邮箱被识别为垃圾邮件或触发限流
