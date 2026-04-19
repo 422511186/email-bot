@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/emersion/go-imap"
@@ -51,7 +52,22 @@ func FetchNewEmails(src config.SourceAccount, lastUID uint32, initialized bool) 
 		return FetchResult{NewLastUID: lastUID}, fmt.Errorf("登录: %w", err)
 	}
 
+	// Some providers (e.g. NetEase 163/126) may require the client to send an
+	// IMAP ID command before selecting a mailbox, otherwise they may reply with
+	// "Unsafe Login".
+	trySendClientID(c, src.Host)
+
 	mbox, err := c.Select(src.Mailbox, true /* 只读 */)
+	if err != nil {
+		// Compatibility: NetEase sometimes rejects EXAMINE with "Unsafe Login".
+		// Fall back to SELECT once to verify.
+		if strings.Contains(err.Error(), "Unsafe Login") {
+			if m2, err2 := c.Select(src.Mailbox, false /* not read-only */); err2 == nil {
+				mbox = m2
+				err = nil
+			}
+		}
+	}
 	if err != nil {
 		return FetchResult{NewLastUID: lastUID}, fmt.Errorf("选择邮箱 %q: %w", src.Mailbox, err)
 	}

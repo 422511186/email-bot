@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -55,23 +56,41 @@ func Load(path string) (*Config, error) {
 	// ── 应用默认值 ───────────────────────────────────────────
 	for i := range cfg.Sources {
 		s := &cfg.Sources[i]
+		// Normalize user input early to avoid confusing IMAP errors.
+		s.Host = strings.TrimSpace(s.Host)
+		s.Username = strings.TrimSpace(s.Username)
+		s.Password = strings.TrimSpace(s.Password)
+		s.Mailbox = strings.TrimSpace(s.Mailbox)
+
 		if s.Port == 0 {
 			s.Port = 993
 		}
 		if s.Mailbox == "" {
 			s.Mailbox = "INBOX"
 		}
+		// Common typo: INB0X (zero) instead of INBOX (letter O).
+		if strings.EqualFold(s.Mailbox, "INB0X") {
+			s.Mailbox = "INBOX"
+		}
 		if s.Name == "" {
 			s.Name = s.Username
+		}
+
+		for ti := range s.Targets {
+			s.Targets[ti] = strings.TrimSpace(s.Targets[ti])
 		}
 	}
 
 	if cfg.SMTP.Port == 0 {
 		cfg.SMTP.Port = 587
 	}
+	cfg.SMTP.Host = strings.TrimSpace(cfg.SMTP.Host)
+	cfg.SMTP.Username = strings.TrimSpace(cfg.SMTP.Username)
+	cfg.SMTP.Password = strings.TrimSpace(cfg.SMTP.Password)
 	if cfg.SMTP.From == "" {
 		cfg.SMTP.From = cfg.SMTP.Username
 	}
+	cfg.SMTP.From = strings.TrimSpace(cfg.SMTP.From)
 
 	if cfg.StateFile == "" {
 		home, err := os.UserHomeDir()

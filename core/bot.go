@@ -199,6 +199,7 @@ func (b *Bot) pollSource(src config.SourceAccount) {
 	result, err := FetchNewEmails(src, lastUID, initialized)
 
 	if err != nil {
+		err = makeUserFacingError(err, src)
 		b.mu.Lock()
 		status.LastError = err
 		b.mu.Unlock()
