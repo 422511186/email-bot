@@ -125,13 +125,13 @@ TUI (Bubbletea)
 └── 渲染函数
     ├── renderHeader()     # 头部：状态 + 倒计时
     ├── renderBody()       # 主体：双面板
-    ├── renderMailboxPanel()  # 左面板：邮箱列表
+    ├── renderMailboxPanel()  # 左面板：邮箱列表 + 绑定信息
     ├── renderLogPanel()      # 右面板：活动日志
     └── renderFooter()       # 底部：快捷键提示
 ```
 
 **职责**：
-- 双面板布局（邮箱列表 + 日志）
+- 双面板布局（邮箱列表/绑定信息 + 日志）
 - 实时状态显示
 - 用户交互处理
 - 滚动和导航

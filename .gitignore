@@ -1,7 +1,7 @@
 # Local Codex/agent workspace state
+.codex
 .codex/
 
 # Local runtime configuration (contains secrets)
 config.yaml
 config.yaml_bak
-

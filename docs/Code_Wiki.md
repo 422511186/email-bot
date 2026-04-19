@@ -27,7 +27,7 @@ Email Bot 是一个使用 Go 语言编写的终端邮件转发机器人。它通
     - [forwarder.go](file:///workspace/core/forwarder.go)：SMTP 客户端，处理邮件头的修改（如添加前缀、发件人信息）及邮件发送（支持 STARTTLS / SSL）。
     - [state.go](file:///workspace/core/state.go)：处理 `state.json` 的读写，保存邮箱的 UID 高水位线（High-water mark）以实现增量同步。
 - **`tui/` (终端界面)**
-  - **职责**：使用 Bubbletea 实现双面板 TUI 界面。左侧显示邮箱状态与进度，右侧展示实时滚动日志。接收后台发出的事件并重新渲染。内部实现在 [app.go](file:///workspace/tui/app.go)。
+  - **职责**：使用 Bubbletea 实现双面板 TUI 界面。左侧显示邮箱状态，并在下方展示当前选中邮箱的绑定信息（IMAP/文件夹/目标地址）；右侧展示实时滚动日志。接收后台发出的事件并重新渲染。内部实现在 [app.go](file:///workspace/tui/app.go)。
 
 ## 4. 关键类与函数说明
 
