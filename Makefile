@@ -7,6 +7,26 @@ LDFLAGS  := -ldflags "-s -w -X main.Version=$(VERSION)"
 build:
 	go build $(LDFLAGS) -o $(BINARY) .
 
+# ── Build and Install (System wide) ──────────────────────────────
+.PHONY: install
+install: build
+	@echo "Installing $(BINARY) to /usr/local/bin..."
+	@sudo cp $(BINARY) /usr/local/bin/$(BINARY)
+	@echo "Installation complete."
+
+# ── Upgrade Helper (Fetch, Build, Install) ───────────────────────
+.PHONY: upgrade
+upgrade:
+	@echo "Fetching latest changes..."
+	git pull
+	@echo "Downloading dependencies..."
+	$(MAKE) deps
+	@echo "Building new binary..."
+	$(MAKE) build
+	@echo "Replacing existing installation..."
+	@sudo cp $(BINARY) /usr/local/bin/$(BINARY)
+	@echo "Upgrade complete! Please restart your service."
+
 # ── Run (requires config.yaml in current dir) ───────────────────
 .PHONY: run
 run:

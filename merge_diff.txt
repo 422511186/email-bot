@@ -1,0 +1,1245 @@
+diff --git a/Makefile b/Makefile
+index e883e21..0f92d96 100644
+--- a/Makefile
++++ b/Makefile
+@@ -7,6 +7,26 @@ LDFLAGS  := -ldflags "-s -w -X main.Version=$(VERSION)"
+ build:
+ 	go build $(LDFLAGS) -o $(BINARY) .
+ 
++# ── Build and Install (System wide) ──────────────────────────────
++.PHONY: install
++install: build
++	@echo "Installing $(BINARY) to /usr/local/bin..."
++	@sudo cp $(BINARY) /usr/local/bin/$(BINARY)
++	@echo "Installation complete."
++
++# ── Upgrade Helper (Fetch, Build, Install) ───────────────────────
++.PHONY: upgrade
++upgrade:
++	@echo "Fetching latest changes..."
++	git pull
++	@echo "Downloading dependencies..."
++	$(MAKE) deps
++	@echo "Building new binary..."
++	$(MAKE) build
++	@echo "Replacing existing installation..."
++	@sudo cp $(BINARY) /usr/local/bin/$(BINARY)
++	@echo "Upgrade complete! Please restart your service."
++
+ # ── Run (requires config.yaml in current dir) ───────────────────
+ .PHONY: run
+ run:
+diff --git a/README.md b/README.md
+index cac2ed5..c9ab5de 100644
+--- a/README.md
++++ b/README.md
+@@ -31,7 +31,9 @@
+ | **首次运行保护** | 首次启动时记录当前邮箱状态，不转发历史邮件 |
+ | **一对多转发** | 一个源邮箱 → 多个目标地址 |
+ | **多对多配置** | 多个源邮箱，每个可配置独立的目标列表 |
+-| **SMTP 传输** | 支持 STARTTLS（587 端口）和隐式 TLS/SSL（465 端口） |
++| **SMTP 传输与复用** | 支持 STARTTLS（587 端口）和隐式 TLS/SSL（465 端口），并在批量转发时复用底层 SMTP 连接，防止触发服务器限流 |
++| **MIME 主题支持** | 智能解码原邮件的 Base64/Quoted-Printable 主题，安全注入前缀后重新编码，拒绝乱码 |
++| **网络超时控制** | 为 IMAP 拉取和 SMTP 拨号设置了严格的超时控制 (30s)，防止因网络黑洞导致的 Goroutine 永久阻塞 |
+ | **邮件间隔控制** | 可配置转发间隔，避免触发目标邮箱限流 |
+ | **持久化状态** | 重启后状态保留（`~/.email-bot/state.json`） |
+ | **实时 TUI** | 双面板仪表板：左侧邮箱状态，右侧可滚动活动日志 |
+@@ -265,6 +267,8 @@ make init-config    # 复制配置示例
+ - [API 参考](docs/API.md) - 类型定义与函数接口
+ - [配置指南](docs/CONFIG.md) - 配置项详解与常见邮箱配置
+ - [部署指南](docs/DEPLOYMENT.md) - 安装部署与后台运行
++- [升级指南](docs/UPGRADE.md) - 源代码平滑编译与优雅升级流程
++- [Code Wiki](docs/Code_Wiki.md) - 源码架构与重构详情
+ 
+ ---
+ 
+diff --git a/core/bot.go b/core/bot.go
+index 2ee9b80..c553ff9 100644
+--- a/core/bot.go
++++ b/core/bot.go
+@@ -48,6 +48,7 @@ type Bot struct {
+ 	events   chan Event
+ 	stopCh   chan struct{}
+ 	pollNow  chan struct{}
++	wg       sync.WaitGroup
+ 	mu       sync.RWMutex
+ 	statuses map[string]*MailboxStatus // 以 Username 为键
+ 	nextPoll time.Time
+@@ -113,13 +114,17 @@ func (b *Bot) TriggerPoll() {
+ 	}
+ }
+ 
+-// Stop 信号通知机器人正常关闭。
++// Stop 信号通知机器人正常关闭，并等待当前处理中的轮询完成。
+ func (b *Bot) Stop() {
+ 	close(b.stopCh)
++	b.wg.Wait()
+ }
+ 
+ // Run 是机器人的主循环。在 goroutine 中调用。
+ func (b *Bot) Run() {
++	b.wg.Add(1)
++	defer b.wg.Done()
++
+ 	b.emit(EventLog, "🚀 邮件机器人已启动 — 执行初始轮询…")
+ 	b.runPollCycle()
+ 
+@@ -135,7 +140,7 @@ func (b *Bot) Run() {
+ 		case <-b.pollNow:
+ 			b.runPollCycle()
+ 		case <-b.stopCh:
+-			b.emit(EventLog, "🛑 邮件机器人已停止")
++			b.emit(EventLog, "🛑 邮件机器人正在安全停止中...")
+ 			return
+ 		}
+ 	}
+@@ -145,11 +150,19 @@ func (b *Bot) Run() {
+ func (b *Bot) runPollCycle() {
+ 	b.emit(EventLog, "🔄 开始轮询周期…")
+ 
++	// 限制同时并发轮询的邮箱数为 5，防止协程和连接数过多导致资源耗尽
++	const maxConcurrentSources = 5
++	sem := make(chan struct{}, maxConcurrentSources)
++
+ 	var wg sync.WaitGroup
+ 	for _, src := range b.cfg.Sources {
+ 		wg.Add(1)
+ 		go func(src config.SourceAccount) {
+ 			defer wg.Done()
++			
++			sem <- struct{}{}        // 获取信号量
++			defer func() { <-sem }() // 释放信号量
++			
+ 			b.pollSource(src)
+ 		}(src)
+ 	}
+@@ -189,21 +202,24 @@ func (b *Bot) pollSource(src config.SourceAccount) {
+ 		b.mu.Lock()
+ 		status.LastError = err
+ 		b.mu.Unlock()
+-		b.emit(EventLog, fmt.Sprintf("❌ %s: 获取错误 — %v", src.Name, err))
+-		return
+-	}
+-
+-	b.mu.Lock()
+-	status.LastError = nil
+-	b.mu.Unlock()
+-
+-	// 持久化新的高水位 UID
+-	if result.NewLastUID > 0 {
+-		b.state.SetLastUID(src.Username, result.NewLastUID)
++		b.emit(EventLog, fmt.Sprintf("❌ %s: 获取时发生部分错误 — %v", src.Name, err))
++		
++		// 注意：不要直接 return！
++		// 因为 FetchNewEmails 在分批拉取时，如果遇到错误，
++		// 依然会返回在错误发生之前成功拉取到的部分邮件 (result.Emails)。
++		// 如果这里直接 return，那些成功拉取的邮件将被丢弃并在下一次轮询中重复下载。
++	} else {
++		b.mu.Lock()
++		status.LastError = nil
++		b.mu.Unlock()
+ 	}
+ 
+ 	// 首次运行初始化 — 暂无邮件需要转发
+ 	if !initialized {
++		// 持久化初始高水位 UID (无论是否为空邮箱，都必须标记为已初始化)
++		b.state.SetLastUID(src.Username, result.NewLastUID)
++		_ = b.state.Save(b.cfg.StateFile) // 立即落盘
++
+ 		b.emit(EventLog, fmt.Sprintf(
+ 			"🔖 %s: 已初始化（UID 高水位 = %d，此后新邮件将被转发）",
+ 			src.Name, result.NewLastUID,
+@@ -213,17 +229,36 @@ func (b *Bot) pollSource(src config.SourceAccount) {
+ 
+ 	if len(result.Emails) == 0 {
+ 		b.emit(EventLog, fmt.Sprintf("💤 %s: 无新邮件", src.Name))
++		// 如果当前有遇到无法解析跳过的坏邮件（导致 Emails 为空但 maxUID 推进了）
++		// 我们也应该推进 LastUID，防止无限重试这封坏邮件
++		if result.NewLastUID > lastUID {
++			b.state.SetLastUID(src.Username, result.NewLastUID)
++			_ = b.state.Save(b.cfg.StateFile)
++		}
+ 		return
+ 	}
+ 
+ 	b.emit(EventLog, fmt.Sprintf("📨 %s: 发现 %d 封新邮件", src.Name, len(result.Emails)))
+ 
++	smtpClient, err := NewSMTPForwarder(b.cfg.SMTP)
++	if err != nil {
++		b.emit(EventLog, fmt.Sprintf("❌ SMTP 连接失败: %v", err))
++		return
++	}
++	defer smtpClient.Close()
++
++	forwardFailed := false
++
+ 	for i, email := range result.Emails {
+-		if err := ForwardEmail(b.cfg.SMTP, email, src.Targets); err != nil {
++		if err := smtpClient.ForwardEmail(email, src.Targets); err != nil {
+ 			b.emit(EventLog, fmt.Sprintf(
+ 				"❌ 转发失败 \"%s\": %v",
+ 				clip(email.Subject, 45), err,
+ 			))
++			// 如果转发失败，停止后续邮件的转发和状态更新
++			// 确保失败的邮件在下一次轮询时被重新拉取重试
++			forwardFailed = true
++			break
+ 		} else {
+ 			b.mu.Lock()
+ 			status.TotalFwded++
+@@ -233,6 +268,11 @@ func (b *Bot) pollSource(src config.SourceAccount) {
+ 				clip(email.Subject, 38),
+ 				strings.Join(src.Targets, ", "),
+ 			))
++			
++			// 只有成功转发后，才更新并持久化当前邮件的 UID
++			b.state.SetLastUID(src.Username, email.UID)
++			_ = b.state.Save(b.cfg.StateFile)
++
+ 			b.emitStatus(src.Username)
+ 		}
+ 		// 邮件之间添加延迟，避免目标邮箱被识别为垃圾邮件或触发限流
+@@ -240,6 +280,17 @@ func (b *Bot) pollSource(src config.SourceAccount) {
+ 			time.Sleep(time.Duration(b.cfg.ForwardDelay) * time.Millisecond)
+ 		}
+ 	}
++
++	// 仅当本批次所有邮件都成功转发（未触发 break），
++	// 且有因为 body 损坏而被跳过的坏邮件（导致 result.NewLastUID 大于最后一个成功邮件的 UID）时，
++	// 我们才使用 result.NewLastUID 兜底推进，跨过死信，防止下一轮死循环。
++	if !forwardFailed {
++		currentSavedUID := b.state.GetLastUID(src.Username)
++		if result.NewLastUID > currentSavedUID {
++			b.state.SetLastUID(src.Username, result.NewLastUID)
++			_ = b.state.Save(b.cfg.StateFile)
++		}
++	}
+ }
+ 
+ // ── 辅助函数 ─────────────────────────────────────────────────────────────
+diff --git a/core/fetcher.go b/core/fetcher.go
+index 57d0744..ecd06a3 100644
+--- a/core/fetcher.go
++++ b/core/fetcher.go
+@@ -1,9 +1,9 @@
+ package core
+ 
+ import (
+-	"bytes"
+ 	"fmt"
+ 	"io"
++	"net"
+ 	"time"
+ 
+ 	"github.com/emersion/go-imap"
+@@ -37,12 +37,16 @@ type FetchResult struct {
+ func FetchNewEmails(src config.SourceAccount, lastUID uint32, initialized bool) (FetchResult, error) {
+ 	addr := fmt.Sprintf("%s:%d", src.Host, src.Port)
+ 
+-	c, err := client.DialTLS(addr, nil)
++	dialer := &net.Dialer{Timeout: 30 * time.Second}
++	c, err := client.DialWithDialerTLS(dialer, addr, nil)
+ 	if err != nil {
+ 		return FetchResult{NewLastUID: lastUID}, fmt.Errorf("连接 %s: %w", addr, err)
+ 	}
+ 	defer func() { _ = c.Logout() }()
+ 
++	// 为所有后续的 IMAP 命令设置超时时间，防止因服务器假死导致整个 Goroutine 永久阻塞
++	c.Timeout = 30 * time.Second
++
+ 	if err := c.Login(src.Username, src.Password); err != nil {
+ 		return FetchResult{NewLastUID: lastUID}, fmt.Errorf("登录: %w", err)
+ 	}
+@@ -122,55 +126,69 @@ func searchUIDs(c *client.Client, lastUID uint32) ([]uint32, error) {
+ }
+ 
+ // fetchMessages 下载 uids 中每个 UID 对应邮件的 RFC-822 正文。
++// 增加了分页拉取，避免大批量邮件导致内存溢出。
+ func fetchMessages(c *client.Client, uids []uint32, currentMax uint32) ([]FetchedEmail, uint32, error) {
+-	seqset := new(imap.SeqSet)
+-	for _, uid := range uids {
+-		seqset.AddNum(uid)
+-	}
+-
+-	section := &imap.BodySectionName{}
+-	items := []imap.FetchItem{
+-		imap.FetchUid,
+-		imap.FetchEnvelope,
+-		section.FetchItem(),
+-	}
+-
+-	msgCh := make(chan *imap.Message, 16)
+-	fetchErr := make(chan error, 1)
+-	go func() {
+-		fetchErr <- c.UidFetch(seqset, items, msgCh)
+-	}()
+-
+ 	var emails []FetchedEmail
+ 	maxUID := currentMax
++	const batchSize = 50 // 分页大小，每次最多拉取 50 封邮件
+ 
+-	for msg := range msgCh {
+-		if msg == nil {
+-			continue
++	for i := 0; i < len(uids); i += batchSize {
++		end := i + batchSize
++		if end > len(uids) {
++			end = len(uids)
+ 		}
+-		if msg.Uid > maxUID {
+-			maxUID = msg.Uid
++		batchUIDs := uids[i:end]
++
++		seqset := new(imap.SeqSet)
++		for _, uid := range batchUIDs {
++			seqset.AddNum(uid)
+ 		}
+ 
+-		body := msg.GetBody(section)
+-		if body == nil {
+-			continue
++		section := &imap.BodySectionName{}
++		items := []imap.FetchItem{
++			imap.FetchUid,
++			imap.FetchEnvelope,
++			section.FetchItem(),
+ 		}
+-		raw, err := io.ReadAll(body)
+-		if err != nil {
+-			continue
++
++		msgCh := make(chan *imap.Message, 16)
++		fetchErr := make(chan error, 1)
++		go func() {
++			fetchErr <- c.UidFetch(seqset, items, msgCh)
++		}()
++
++		for msg := range msgCh {
++			if msg == nil {
++				continue
++			}
++			if msg.Uid > maxUID {
++				maxUID = msg.Uid
++			}
++
++			body := msg.GetBody(section)
++			if body == nil {
++				continue
++			}
++			raw, err := io.ReadAll(body)
++			if err != nil {
++				continue
++			}
++
++			emails = append(emails, FetchedEmail{
++				UID:     msg.Uid,
++				Subject: envelopeSubject(msg),
++				From:    envelopeFrom(msg),
++				Date:    envelopeDate(msg),
++				Raw:     raw,
++			})
+ 		}
+ 
+-		emails = append(emails, FetchedEmail{
+-			UID:     msg.Uid,
+-			Subject: envelopeSubject(msg),
+-			From:    envelopeFrom(msg),
+-			Date:    envelopeDate(msg),
+-			Raw:     bytes.Clone(raw),
+-		})
++		if err := <-fetchErr; err != nil {
++			return emails, maxUID, err
++		}
+ 	}
+ 
+-	return emails, maxUID, <-fetchErr
++	return emails, maxUID, nil
+ }
+ 
+ func envelopeSubject(msg *imap.Message) string {
+@@ -185,6 +203,9 @@ func envelopeFrom(msg *imap.Message) string {
+ 		return ""
+ 	}
+ 	a := msg.Envelope.From[0]
++	if a == nil {
++		return ""
++	}
+ 	if a.PersonalName != "" {
+ 		return fmt.Sprintf("%s <%s@%s>", a.PersonalName, a.MailboxName, a.HostName)
+ 	}
+diff --git a/core/forwarder.go b/core/forwarder.go
+index 76b7469..cc40f41 100644
+--- a/core/forwarder.go
++++ b/core/forwarder.go
+@@ -1,10 +1,14 @@
+ package core
+ 
+ import (
++	"bytes"
+ 	"crypto/tls"
+ 	"fmt"
++	"mime"
++	"net"
+ 	"net/smtp"
+ 	"strings"
++	"time"
+ 
+ 	"email-bot/config"
+ 
+@@ -18,20 +22,98 @@ func init() {
+ 	charset.RegisterEncoding("gb2312", simplifiedchinese.GBK)
+ }
+ 
+-func ForwardEmail(smtpCfg config.SMTPConfig, email FetchedEmail, targets []string) error {
++type SMTPForwarder struct {
++	client *smtp.Client
++	from   string
++}
++
++func NewSMTPForwarder(cfg config.SMTPConfig) (*SMTPForwarder, error) {
++	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
++	dialer := &net.Dialer{Timeout: 30 * time.Second}
++
++	var conn net.Conn
++	var err error
++	var client *smtp.Client
++
++	if cfg.Port == 465 {
++		tlsCfg := &tls.Config{ServerName: cfg.Host, MinVersion: tls.VersionTLS12}
++		conn, err = tls.DialWithDialer(dialer, "tcp", addr, tlsCfg)
++		if err != nil {
++			return nil, fmt.Errorf("TLS 拨号: %w", err)
++		}
++		client, err = smtp.NewClient(conn, cfg.Host)
++		if err != nil {
++			conn.Close()
++			return nil, fmt.Errorf("SMTP 客户端: %w", err)
++		}
++	} else {
++		conn, err = dialer.Dial("tcp", addr)
++		if err != nil {
++			return nil, fmt.Errorf("TCP 拨号: %w", err)
++		}
++		client, err = smtp.NewClient(conn, cfg.Host)
++		if err != nil {
++			conn.Close()
++			return nil, fmt.Errorf("SMTP 客户端: %w", err)
++		}
++
++		if ok, _ := client.Extension("STARTTLS"); ok {
++			tlsCfg := &tls.Config{ServerName: cfg.Host}
++			if err = client.StartTLS(tlsCfg); err != nil {
++				client.Close()
++				return nil, fmt.Errorf("STARTTLS: %w", err)
++			}
++		}
++	}
++
++	auth := smtp.PlainAuth("", cfg.Username, cfg.Password, cfg.Host)
++	if err := client.Auth(auth); err != nil {
++		client.Close()
++		return nil, fmt.Errorf("SMTP 认证: %w", err)
++	}
++
++	return &SMTPForwarder{client: client, from: cfg.From}, nil
++}
++
++func (f *SMTPForwarder) ForwardEmail(email FetchedEmail, targets []string) error {
+ 	if len(targets) == 0 {
+ 		return fmt.Errorf("未提供目标地址")
+ 	}
+ 
+-	body := prependResentHeaders(smtpCfg.From, email.From, email.Raw)
+-	addr := fmt.Sprintf("%s:%d", smtpCfg.Host, smtpCfg.Port)
+-	auth := smtp.PlainAuth("", smtpCfg.Username, smtpCfg.Password, smtpCfg.Host)
++	body := prependResentHeaders(f.from, email.From, email.Raw)
++
++	if err := f.client.Mail(f.from); err != nil {
++		return fmt.Errorf("SMTP MAIL FROM: %w", err)
++	}
++	for _, rcpt := range targets {
++		if err := f.client.Rcpt(rcpt); err != nil {
++			return fmt.Errorf("SMTP RCPT TO %s: %w", rcpt, err)
++		}
++	}
++
++	wc, err := f.client.Data()
++	if err != nil {
++		return fmt.Errorf("SMTP DATA: %w", err)
++	}
++
++	// 无论写入成功与否，必须关闭数据流，否则会导致整个 SMTP 连接处于挂起状态而死锁
++	defer func() {
++		_ = wc.Close()
++	}()
+ 
+-	if smtpCfg.Port == 465 {
+-		return sendMailImplicitTLS(addr, smtpCfg.Host, auth, smtpCfg.From, targets, body)
++	if _, err := wc.Write(body); err != nil {
++		return fmt.Errorf("SMTP 写入正文: %w", err)
+ 	}
+ 
+-	return smtp.SendMail(addr, auth, smtpCfg.From, targets, body)
++	return nil
++}
++
++func (f *SMTPForwarder) Close() error {
++	if f.client != nil {
++		f.client.Quit()
++		return f.client.Close()
++	}
++	return nil
+ }
+ 
+ func prependResentHeaders(from, originalFrom string, original []byte) []byte {
+@@ -58,51 +140,77 @@ func prependResentHeaders(from, originalFrom string, original []byte) []byte {
+ }
+ 
+ func modifySubject(original []byte, prefix string) []byte {
+-	s := string(original)
+-	lines := strings.Split(s, "\r\n")
+-	for i, line := range lines {
+-		if strings.HasPrefix(strings.ToLower(line), "subject:") {
+-			lines[i] = line[:8] + prefix + strings.TrimLeft(line[8:], " \t")
+-			break
++	headerEnd := bytes.Index(original, []byte("\r\n\r\n"))
++	if headerEnd == -1 {
++		headerEnd = bytes.Index(original, []byte("\n\n"))
++		if headerEnd == -1 {
++			return original
+ 		}
+ 	}
+-	return []byte(strings.Join(lines, "\r\n"))
+-}
+ 
+-func sendMailImplicitTLS(addr, host string, auth smtp.Auth, from string, to []string, body []byte) error {
+-	tlsCfg := &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}
++	headers := string(original[:headerEnd])
++	body := original[headerEnd:]
+ 
+-	conn, err := tls.Dial("tcp", addr, tlsCfg)
+-	if err != nil {
+-		return fmt.Errorf("TLS 拨号: %w", err)
+-	}
++	// 统一处理可能混用的 \r\n 和 \n
++	lines := strings.Split(strings.ReplaceAll(headers, "\r\n", "\n"), "\n")
++	var outLines []string
+ 
+-	c, err := smtp.NewClient(conn, host)
+-	if err != nil {
+-		return fmt.Errorf("SMTP 客户端: %w", err)
++	inSubject := false
++	var subjectRaw string
++
++	for _, line := range lines {
++		lowerLine := strings.ToLower(line)
++		isContinuation := strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t")
++
++		if inSubject {
++			if isContinuation {
++				subjectRaw += "\n" + line
++				continue
++			} else {
++				inSubject = false
++				outLines = append(outLines, processSubject(subjectRaw, prefix))
++			}
++		}
++
++		if strings.HasPrefix(lowerLine, "subject:") {
++			inSubject = true
++			subjectRaw = line
++		} else {
++			outLines = append(outLines, line)
++		}
+ 	}
+-	defer func() { _ = c.Quit() }()
+ 
+-	if err := c.Auth(auth); err != nil {
+-		return fmt.Errorf("SMTP 认证: %w", err)
++	if inSubject {
++		outLines = append(outLines, processSubject(subjectRaw, prefix))
+ 	}
+-	if err := c.Mail(from); err != nil {
+-		return fmt.Errorf("SMTP MAIL FROM: %w", err)
++
++	newHeaders := strings.Join(outLines, "\r\n")
++	return append([]byte(newHeaders), body...)
++}
++
++func processSubject(rawLine, prefix string) string {
++	parts := strings.SplitN(rawLine, ":", 2)
++	if len(parts) != 2 {
++		return rawLine
+ 	}
+-	for _, rcpt := range to {
+-		if err := c.Rcpt(rcpt); err != nil {
+-			return fmt.Errorf("SMTP RCPT TO %s: %w", rcpt, err)
+-		}
++	
++	// 去除多行折叠带来的换行符，便于统一解码
++	val := strings.ReplaceAll(parts[1], "\n", "")
++	val = strings.ReplaceAll(val, "\r", "")
++	val = strings.TrimSpace(val)
++
++	dec := &mime.WordDecoder{
++		CharsetReader: charset.Reader,
+ 	}
+-
+-	wc, err := c.Data()
++	decoded, err := dec.DecodeHeader(val)
+ 	if err != nil {
+-		return fmt.Errorf("SMTP DATA: %w", err)
+-	}
+-	if _, err := wc.Write(body); err != nil {
+-		return fmt.Errorf("SMTP 写入正文: %w", err)
++		// 降级处理：如果无法解码（如格式损坏），避免再次错误编码导致彻底乱码
++		// 直接将其作为普通的 ascii 拼接前缀返回
++		return "Subject: " + prefix + val
+ 	}
+-	return wc.Close()
+-}
+ 
++	newSubj := prefix + decoded
++	encoded := mime.BEncoding.Encode("utf-8", newSubj)
+ 
++	return "Subject: " + encoded
++}
+diff --git a/core/forwarder_test.go b/core/forwarder_test.go
+new file mode 100644
+index 0000000..001dcc2
+--- /dev/null
++++ b/core/forwarder_test.go
+@@ -0,0 +1,39 @@
++package core
++
++import (
++	"bytes"
++	"testing"
++)
++
++func TestModifySubject_Normal(t *testing.T) {
++	raw := []byte("From: a@b.com\r\nSubject: Hello\r\nTo: c@d.com\r\n\r\nBody")
++	res := modifySubject(raw, "[Bot] - ")
++	
++	if !bytes.Contains(res, []byte("Subject: [Bot] - Hello")) {
++		t.Errorf("Unexpected result: %s", res)
++	}
++}
++
++func TestModifySubject_Encoded(t *testing.T) {
++	// =?utf-8?B?5rWL6K+V?= means "测试"
++	raw := []byte("Subject: =?utf-8?B?5rWL6K+V?=\r\n\r\nBody")
++	res := modifySubject(raw, "[Prefix] ")
++	
++	// "[Prefix] 测试" base64 encoded -> W1ByZWZpeF0g5rWL6K+V
++	expected := "Subject: =?utf-8?b?W1ByZWZpeF0g5rWL6K+V?="
++	if !bytes.Contains(res, []byte(expected)) {
++		t.Errorf("Unexpected result: %s", res)
++	}
++}
++
++func TestModifySubject_Folded(t *testing.T) {
++	// "Subject: =?utf-8?B?5rWL6K+V?=\r\n  =?utf-8?B?5rWL6K+V?=" -> "测试测试"
++	raw := []byte("Subject: =?utf-8?B?5rWL6K+V?=\r\n  =?utf-8?B?5rWL6K+V?=\r\n\r\nBody")
++	res := modifySubject(raw, "[P] ")
++	
++	// "[P] 测试测试"
++	expected := "Subject: =?utf-8?b?W1BdIOa1i+ivlea1i+ivlQ==?="
++	if !bytes.Contains(res, []byte(expected)) {
++		t.Errorf("Unexpected result: %s", string(res))
++	}
++}
+diff --git a/core/state.go b/core/state.go
+index 6a7b0c4..bd92730 100644
+--- a/core/state.go
++++ b/core/state.go
+@@ -16,7 +16,8 @@ type sourceState struct {
+ 
+ // State 保存所有跨重启的持久化数据。
+ type State struct {
+-	mu      sync.RWMutex
++	mu     sync.RWMutex
++	fileMu sync.Mutex // 专用的文件系统写锁，防止并发向同一个 tmp 文件写入导致数据错乱
+ 	Sources map[string]*sourceState `json:"sources"`
+ }
+ 
+@@ -47,6 +48,10 @@ func (s *State) Save(path string) error {
+ 		return err
+ 	}
+ 
++	// 从这里开始进行磁盘 I/O，使用专门的文件锁，防止多个 Goroutine 并发写毁状态文件
++	s.fileMu.Lock()
++	defer s.fileMu.Unlock()
++
+ 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+ 		return err
+ 	}
+@@ -83,6 +88,9 @@ func (s *State) IsInitialized(username string) bool {
+ func (s *State) SetLastUID(username string, uid uint32) {
+ 	s.mu.Lock()
+ 	defer s.mu.Unlock()
++	if s.Sources == nil {
++		s.Sources = make(map[string]*sourceState)
++	}
+ 	if _, ok := s.Sources[username]; !ok {
+ 		s.Sources[username] = &sourceState{}
+ 	}
+diff --git a/dist/email-bot-darwin-amd64 b/dist/email-bot-darwin-amd64
+new file mode 100755
+index 0000000..ae7f205
+Binary files /dev/null and b/dist/email-bot-darwin-amd64 differ
+diff --git a/dist/email-bot-darwin-arm64 b/dist/email-bot-darwin-arm64
+new file mode 100755
+index 0000000..a281682
+Binary files /dev/null and b/dist/email-bot-darwin-arm64 differ
+diff --git a/dist/email-bot-linux-amd64 b/dist/email-bot-linux-amd64
+new file mode 100755
+index 0000000..e1212e8
+Binary files /dev/null and b/dist/email-bot-linux-amd64 differ
+diff --git a/dist/email-bot-linux-arm64 b/dist/email-bot-linux-arm64
+new file mode 100755
+index 0000000..0036ef6
+Binary files /dev/null and b/dist/email-bot-linux-arm64 differ
+diff --git a/dist/email-bot-windows-amd64.exe b/dist/email-bot-windows-amd64.exe
+new file mode 100755
+index 0000000..81c4cba
+Binary files /dev/null and b/dist/email-bot-windows-amd64.exe differ
+diff --git a/docs/ARCHITECTURE.md b/docs/ARCHITECTURE.md
+index 0f83d53..030706c 100644
+--- a/docs/ARCHITECTURE.md
++++ b/docs/ARCHITECTURE.md
+@@ -86,14 +86,17 @@ Fetcher
+ 
+ ```
+ Forwarder
+-├── ForwardEmail()    # 发送邮件
+-├── prependResentHeaders()  # 添加 Resent-* 头
+-└── sendMailImplicitTLS()   # 隐式 TLS 发送
++├── SMTPForwarder           # SMTP 客户端连接封装
++├── ForwardEmail()          # 复用连接，发送单封邮件
++├── prependResentHeaders()  # 添加 Resent-* 头，修改 Subject
++└── modifySubject()         # MIME 主题智能解码、追加前缀、重新编码
+ ```
+ 
+ **职责**：
+-- SMTP 连接管理
+-- 邮件转发（保留原始内容）
++- SMTP 拨号与认证（带 30 秒超时控制）
++- **SMTP 连接复用**（一轮多封邮件共用一个底层 TLS 连接）
++- 邮件头修改（解析原邮件 Base64 标题并重新编码防止乱码）
++- 邮件转发（保留原始正文与附件）
+ - 支持 STARTTLS 和 SSL
+ 
+ #### State (`state.go`)
+@@ -154,11 +157,13 @@ pollSource(src1)              pollSource(srcN)
+   │                                     │
+   ▼                                     ▼
+ FetchNewEmails()              FetchNewEmails()
+-  │                                     │
+-  ├─────────────────────────────────────┤
++  │
++  ├─────────────────────────────────────┐
++  │  创建单例 SMTPForwarder 连接        │
++  │  (若连接失败或超时 30s 则中断)      │
+   │                                     │
+   ▼                                     ▼
+-ForwardEmail() ──────────▶ SMTP Server
++SMTPForwarder.ForwardEmail()  (复用此连接)
+   │                                     │
+   └─────────────────────────────────────┘
+                     │
+diff --git a/docs/Code_Wiki.md b/docs/Code_Wiki.md
+new file mode 100644
+index 0000000..b5b171c
+--- /dev/null
++++ b/docs/Code_Wiki.md
+@@ -0,0 +1,117 @@
++# 📧 Email Bot - Code Wiki
++
++## 1. 项目概述
++Email Bot 是一个使用 Go 语言编写的终端邮件转发机器人。它通过轮询多个 IMAP 邮箱，增量获取新邮件，并将其转发到一个或多个目标地址，同时提供了一个基于 Bubbletea 构建的实时 TUI (终端用户界面) 仪表板。
++
++## 2. 项目整体架构
++项目采用了清晰的模块化分层架构，主要分为：**入口层**、**配置层**、**核心业务层 (Core)** 和 **展示层 (TUI)**。
++
++### 核心执行流程：
++1. **启动阶段**：[main.go](file:///workspace/main.go) 加载 YAML 配置，初始化 [Bot](file:///workspace/core/bot.go#L44-L54) 实例，并启动后台调度协程 (`go bot.Run()`)，最后启动 TUI [Model](file:///workspace/tui/app.go#L96-L110) 接管主线程。
++2. **轮询阶段**：[Bot.Run()](file:///workspace/core/bot.go#L121-L142) 根据配置的 `poll_interval` 定期触发轮询。
++3. **获取阶段**：[FetchNewEmails()](file:///workspace/core/fetcher.go#L37-L85) 通过 IMAP 协议连接源邮箱，根据本地持久化的 UID 增量拉取新邮件（首次运行仅记录最大UID）。
++4. **转发阶段**：拉取到新邮件后，调用 [ForwardEmail()](file:///workspace/core/forwarder.go#L21-L35) 通过 SMTP 将邮件（带上 `Resent-*` 伪装或修改 Subject 头）转发至目标邮箱。
++5. **持久化与事件**：更新最大 UID 到 [State](file:///workspace/core/state.go#L17-L21) 并原子性存入本地 `state.json`；同时通过 Event Channel 通知 TUI 层更新界面。
++
++## 3. 主要模块职责
++
++- **[main.go](file:///workspace/main.go)**
++  - **职责**：程序入口点，负责解析命令行参数、加载配置、拼装各模块（Bot 引擎和 TUI 界面），并管理生命周期。
++- **`config/` (配置解析)**
++  - **职责**：加载和验证 `config.yaml`。管理邮箱源 (IMAP)、转发目标、SMTP 配置及全局参数（轮询间隔、延迟等）。
++- **`core/` (核心业务逻辑)**
++  - **职责**：项目的引擎层，不包含任何 UI 逻辑。负责调度任务、网络通信（IMAP/SMTP）和状态管理。
++  - **子模块**：
++    - [bot.go](file:///workspace/core/bot.go)：并发调度与事件总线中心。
++    - [fetcher.go](file:///workspace/core/fetcher.go)：IMAP 客户端，处理 UID 搜索和邮件原文下载。
++    - [forwarder.go](file:///workspace/core/forwarder.go)：SMTP 客户端，处理邮件头的修改（如添加前缀、发件人信息）及邮件发送（支持 STARTTLS / SSL）。
++    - [state.go](file:///workspace/core/state.go)：处理 `state.json` 的读写，保存邮箱的 UID 高水位线（High-water mark）以实现增量同步。
++- **`tui/` (终端界面)**
++  - **职责**：使用 Bubbletea 实现双面板 TUI 界面。左侧显示邮箱状态与进度，右侧展示实时滚动日志。接收后台发出的事件并重新渲染。内部实现在 [app.go](file:///workspace/tui/app.go)。
++
++## 4. 关键类与函数说明
++
++### 4.1 配置管理 (`config` 包)
++- **[Config](file:///workspace/config/config.go#L31-L38)**：配置实体结构。其中的 `SourceAccount` 包含单个 IMAP 源及对应的 `Targets`。
++- **[Load()](file:///workspace/config/config.go#L40-L90)**：读取并反序列化 YAML，注入默认值（如默认端口 993/587）并执行字段校验。
++
++### 4.2 核心调度 (`core` 包)
++- **[Bot](file:///workspace/core/bot.go#L44-L54)**：核心调度器，维护配置、状态、事件通道（`events`）以及各邮箱当前状态的并发安全映射。
++- **[Bot.Run()](file:///workspace/core/bot.go#L121-L142)**：阻塞的无限循环函数，根据定时器或手动触发信号（`pollNow`）执行 `runPollCycle()`。
++- **[Bot.pollSource()](file:///workspace/core/bot.go#L164-L243)**：处理单一邮箱的具体流程：获取最新邮件 -> 创建单例 `SMTPForwarder` 实例 -> 复用连接逐封转发 -> 更新内存及事件日志。
++
++### 4.3 邮件获取与转发 (`core` 包)
++- **[FetchNewEmails()](file:///workspace/core/fetcher.go#L37-L85)**：
++  - 连接 IMAP 服务器（附带 `30s` 拨号超时保护），如果是首次初始化则调用 `findMaxUID` 获取最高水位并返回；否则调用 `searchUIDs` 获取新 UID 并通过 `fetchMessages` 下载 RFC-822 原文。
++- **[FetchedEmail](file:///workspace/core/fetcher.go#L16-L22)**：承载单封邮件元数据与原始数据的结构体。
++- **[SMTPForwarder](file:///workspace/core/forwarder.go#L22-L25)**：
++  - 核心发送器结构体，负责维护可复用的 SMTP TCP/TLS 底层连接。
++- **[NewSMTPForwarder()](file:///workspace/core/forwarder.go#L27-L69)**：
++  - 初始化 `SMTPForwarder` 实例，提供网络超时控制，并处理 465 隐式 TLS 及 587 STARTTLS 认证。
++- **[SMTPForwarder.ForwardEmail()](file:///workspace/core/forwarder.go#L71-L93)**：
++  - 复用建立的连接发送一封邮件，内部调用 `prependResentHeaders` 进行信封和 Header 修改。
++- **[modifySubject()](file:///workspace/core/forwarder.go#L123-L166)**：
++  - 智能提取原始 Header 并在保证安全（MIME 解码和二次重新编码）的前提下，向原主题注入如 `[发送者] - ` 的前缀，杜绝 Base64 和 Quoted-Printable 造成的乱码问题。
++
++### 4.4 状态持久化 (`core` 包)
++- **[State](file:///workspace/core/state.go#L17-L21)**：包含 `Sources` 映射，记录每个账号的 `LastUID` 和 `Initialized` 标志。
++- **[LoadState()](file:///workspace/core/state.go#L28-L39)**：从文件系统加载历史同步进度。
++- **[State.Save()](file:///workspace/core/state.go#L42-L60)**：将当前高水位状态通过临时文件重命名的方式**原子性**地写入磁盘，防止数据损坏。
++
++### 4.5 界面展示 (`tui` 包)
++- **[Model](file:///workspace/tui/app.go#L96-L110)**：Bubbletea 的核心模型，维护界面宽高、列表选中索引、日志数组及滚动偏移量。
++- **[NewModel()](file:///workspace/tui/app.go#L112-L119)**：构造并初始化 TUI 数据模型。
++- **[Model.Update()](file:///workspace/tui/app.go#L130-L166)**：状态机核心，处理按键事件（`tea.KeyMsg`）、定时器 (`tickMsg`) 以及后台传来的 `botEventMsg`。
++
++## 5. 依赖关系
++
++项目主要依赖以下优秀的开源 Go 库：
++- **UI 与终端**：
++  - [`github.com/charmbracelet/bubbletea`](https://github.com/charmbracelet/bubbletea): 核心 TUI 框架，基于 The Elm Architecture。
++  - [`github.com/charmbracelet/lipgloss`](https://github.com/charmbracelet/lipgloss): 终端样式与布局渲染。
++- **邮件协议处理**：
++  - [`github.com/emersion/go-imap`](https://github.com/emersion/go-imap): IMAP 客户端库，用于连接邮箱及搜索 UID。
++  - [`github.com/emersion/go-message`](https://github.com/emersion/go-message): 解析和处理邮件编码与内容。
++- **配置与工具**：
++  - [`gopkg.in/yaml.v3`](https://gopkg.in/yaml.v3): YAML 配置文件解析。
++  - [`golang.org/x/text`](https://golang.org/x/text): 处理中文字符集编码（GBK, GB18030 等）。
++
++## 6. 项目运行方式
++
++### 6.1 前置要求
++- Go 1.21 或更高版本
++
++### 6.2 编译与构建
++项目提供了一个 [Makefile](file:///workspace/Makefile) 简化操作：
++```bash
++# 安装依赖
++make deps
++
++# 编译当前平台版本
++make build
++
++# 交叉编译全平台版本
++make build-all
++```
++
++### 6.3 配置与运行
++1. 生成配置文件：
++   ```bash
++   make init-config
++   # 或手动复制：cp config.yaml.example config.yaml
++   ```
++2. 编辑 `config.yaml` 填入 IMAP 源邮箱及 SMTP 转发账号的凭据（注意使用应用密码/授权码）。
++3. 运行程序：
++   ```bash
++   # 开发环境运行
++   make run
++   # 或使用构建产物
++   ./email-bot -config config.yaml
++   ```
++
++### 6.4 TUI 交互方式
++- `↑ / ↓` 或 `k / j`：切换左侧查看的邮箱源
++- `Tab`：在左侧邮箱列表与右侧日志面板间切换焦点
++- `PgUp / PgDn` 或 `u / d`：滚动查看历史活动日志
++- `r`：立即触发一次所有邮箱的轮询拉取
++- `q` 或 `Ctrl+C`：安全退出程序
+diff --git a/docs/MODULES.md b/docs/MODULES.md
+index 5ca4dc8..d31859c 100644
+--- a/docs/MODULES.md
++++ b/docs/MODULES.md
+@@ -177,44 +177,42 @@ return uids[len(uids)-1]  // 升序排列，最后是最大
+ 
+ ## core/forwarder.go
+ 
+-**职责**：SMTP 协议封装，邮件转发。
++**职责**：SMTP 协议封装，网络超时控制，MIME 编码解析及连接复用的邮件转发。
+ 
+-### 关键函数
++### 关键结构与函数
+ 
+-#### `ForwardEmail(smtpCfg config.SMTPConfig, email FetchedEmail, targets []string) error`
++#### `SMTPForwarder`
+ 
+-转发单封邮件：
++维护长生命周期的 SMTP Client 和信封发件人信息：
+ 
+ ```go
+-// 1. 准备邮件内容（添加 Resent-* 头）
+-body := prependResentHeaders(from, targets, email.Raw)
+-
+-// 2. 根据端口选择发送方式
+-if smtpCfg.Port == 465 {
+-    return sendMailImplicitTLS(...)  // 隐式 TLS
++type SMTPForwarder struct {
++    client *smtp.Client
++    from   string
+ }
+-return smtp.SendMail(...)  // STARTTLS (587/25)
+ ```
+ 
+-#### `prependResentHeaders(from string, targets []string, original []byte) []byte`
++#### `NewSMTPForwarder(cfg config.SMTPConfig) (*SMTPForwarder, error)`
+ 
+-添加 RFC-2822 Resent-* 头部：
++拨号建立 SMTP 连接：
++- 内置 30 秒的 `net.Dialer` 网络拨号超时控制
++- 根据端口 (465/587) 自动处理隐式 TLS 与 STARTTLS
++- 完成身份认证
+ 
+-```
+-Resent-From: <sender@example.com>
+-Resent-To: target1@example.com, target2@example.com
+-Resent-Date: Mon, 01 Jan 2024 12:00:00 +0800
+-X-Forwarded-By: email-bot
++#### `(f *SMTPForwarder) ForwardEmail(email FetchedEmail, targets []string) error`
+ 
+-[原始邮件内容，包含所有附件和内联图片]
+-```
++复用现有 SMTP 连接转发邮件：
++- 发送 MAIL FROM 和 RCPT TO 指令
++- 将处理后的原邮件数据（`prependResentHeaders`）写入数据流中
+ 
+-#### `sendMailImplicitTLS(addr, host string, auth smtp.Auth, ...) error`
++#### `modifySubject(original []byte, prefix string) []byte`
+ 
+-隐式 TLS 发送（465 端口）：
+-- 建立 TLS 连接
+-- 创建 SMTP 客户端
+-- 认证、发送
++安全修改邮件主题（Subject）：
++- 定位并切分出 Headers 和 Body
++- 支持多行折叠 (Folding) 的 Header 合并
++- 使用 `mime.WordDecoder` 智能解码原有的 Base64/Quoted-Printable 主题
++- 将自定义前缀与原主题拼接后，再通过 `mime.BEncoding` 安全地重新编码
++- 避免破坏原邮件结构导致乱码
+ 
+ ---
+ 
+diff --git a/docs/SUMMARY.md b/docs/SUMMARY.md
+index bf7ae7d..2702d5b 100644
+--- a/docs/SUMMARY.md
++++ b/docs/SUMMARY.md
+@@ -30,6 +30,10 @@
+ - 事件类型列表
+ - 配置结构详解
+ 
++### [代码分析](Code_Wiki.md)
++- 核心流程解析
++- 源码结构导读
++
+ ### [配置指南](CONFIG.md)
+ - 完整配置示例
+ - 各配置项详解
+@@ -42,6 +46,10 @@
+ - 运行方式
+ - 跨平台构建
+ 
++### [升级指南](UPGRADE.md)
++- 版本升级说明
++- 注意事项
++
+ ## 🔗 快速链接
+ 
+ - [项目 README](../README.md) - 快速开始
+diff --git a/docs/UPGRADE.md b/docs/UPGRADE.md
+new file mode 100644
+index 0000000..ac6ef27
+--- /dev/null
++++ b/docs/UPGRADE.md
+@@ -0,0 +1,121 @@
++# 🔄 Email Bot 优雅升级指南
++
++随着 Email Bot 的不断迭代（如：新增网络超时控制、SMTP 连接复用、MIME 解析修复等重大重构），你需要定期更新服务。
++
++为了保证**邮件不丢失、状态不损坏、服务零感知中断**，请务必按照以下“优雅升级”流程进行源代码的重新编译与替换。
++
++---
++
++## 1. 准备工作与环境检查
++
++在开始升级前，请确保你所在的编译环境满足以下条件：
++
++- **Go 环境**：确保已安装 Go 1.21 或更高版本。
++- **Git**：确保可以拉取最新代码。
++
++```bash
++go version
++git --version
++```
++
++## 2. 拉取最新源代码并编译
++
++在不影响当前正在运行的服务的前提下，先在一个新的目录或当前目录克隆/更新代码，并完成编译测试。
++
++```bash
++# 1. 进入你的 email-bot 源码目录
++cd /path/to/email-bot
++
++# 2. 拉取最新代码
++git pull origin main
++
++# 3. 下载/更新最新的依赖包
++make deps
++
++# 4. 编译新版本的二进制文件（编译过程不会影响旧版本运行）
++make build
++
++# 5. 验证新二进制版本是否成功生成
++./email-bot -version
++```
++
++此时，你的目录中应该已经生成了名为 `email-bot`（或 `email-bot.exe`）的最新二进制文件。
++
++## 3. 备份核心数据（极其重要）
++
++在替换旧服务前，**必须备份配置文件和状态文件**。状态文件（`state.json`）记录了所有邮箱的增量拉取进度（高水位 UID），一旦丢失，会导致所有历史邮件被重新转发！
++
++```bash
++# 1. 备份配置文件
++cp config.yaml config.yaml.bak_$(date +%F)
++
++# 2. 备份状态文件（默认路径为 ~/.email-bot/state.json）
++# 注意：如果你的 config.yaml 中自定义了 state_file 路径，请备份对应路径
++cp ~/.email-bot/state.json ~/.email-bot/state.json.bak_$(date +%F)
++```
++
++## 4. 优雅停机 (Graceful Shutdown)
++
++最新版本的 Email Bot 已经支持了“优雅停机”。这意味着它会等待当前正在转发的邮件处理完毕，并将最新的 UID 安全落盘后才会退出，避免强制中断导致的邮件丢失或状态不一致。
++
++### 方式一：如果是在 TUI 终端前台运行
++直接在终端中按下 `q` 或 `Ctrl+C`。
++你会看到日志面板提示：`🛑 邮件机器人正在安全停止中...`。请耐心等待程序完全退出回到 Shell 提示符。
++
++### 方式二：如果是在后台运行 (如 Systemd 或 Nohup)
++发送 `SIGTERM` 或 `SIGINT` 信号给进程（不要使用 `kill -9`）：
++
++```bash
++# 查找进程 ID
++pgrep email-bot
++
++# 发送优雅停止信号
++kill -15 <PID>
++```
++*提示：如果是 Systemd 管理的服务，直接执行 `sudo systemctl stop email-bot` 即可。*
++
++## 5. 替换与重启
++
++确认旧进程已经完全退出后，使用刚刚编译好的新版本覆盖旧版本，并重新启动。
++
++```bash
++# 如果你是将二进制放在了系统 PATH 中（如 /usr/local/bin）
++# sudo cp ./email-bot /usr/local/bin/email-bot
++
++# 启动新版本服务
++# 前台运行查看状态：
++./email-bot -config config.yaml
++
++# 或者使用 Systemd 重启：
++# sudo systemctl start email-bot
++```
++
++## 6. 验证升级结果
++
++升级完成后，请通过以下几个维度确认服务是否正常运转：
++
++1. **版本确认**：
++   观察 TUI 面板或使用 `./email-bot -version` 确认运行的是新版本。
++2. **状态继承检查**：
++   观察 TUI 左侧的邮箱列表，确认各个邮箱的“上次轮询时间”和图标（`✓`）是否正常，且没有触发历史邮件的全量重发。
++3. **功能验证**：
++   - 按下 `r` 键手动触发一次轮询。
++   - 观察右侧的“活动日志”，确认是否输出了 `✅ 轮询周期完成`。
++   - 检查目标邮箱，发送一封测试邮件到源邮箱，确认是否能在几秒内被正确转发（且包含 `[原发件人] - ` 的正确前缀）。
++
++---
++
++## 常见问题 (FAQ)
++
++**Q1：升级后报错 `解析状态: json: cannot unmarshal...` 怎么办？**
++A：这通常是因为跨大版本升级导致 `state.json` 结构不兼容。请停止服务，将备份的 `.bak` 文件恢复，或删除 `state.json` 让机器人重新初始化（注意：删除会导致重新标记高水位，在此之前的未读邮件将不会被转发）。
++
++**Q2：编译时提示 `go: downloading... connection refused`？**
++A：请检查你的网络，或配置 Go 模块代理：
++```bash
++go env -w GOPROXY=https://goproxy.cn,direct
++make deps
++```
++
++**Q3：新的配置文件项怎么更新？**
++A：对比新源码中的 `config.yaml.example` 和你现有的 `config.yaml`。由于向后兼容设计，通常旧配置依然可以运行。如果有新增的必填项，程序会在启动时在终端打印 `❌ 加载配置失败` 的明确提示，根据提示添加即可。
+\ No newline at end of file
+diff --git a/email-bot b/email-bot
+new file mode 100755
+index 0000000..e1b08cb
+Binary files /dev/null and b/email-bot differ
+diff --git a/tui/app.go b/tui/app.go
+index 8c30c00..3b99519 100644
+--- a/tui/app.go
++++ b/tui/app.go
+@@ -84,6 +84,42 @@ type logLine struct {
+ 	msg string
+ }
+ 
++// ── 日志环形缓冲区 ───────────────────────────────────────────────────────
++
++type logBuffer struct {
++	lines []logLine
++	head  int
++	count int
++}
++
++func newLogBuffer(capacity int) *logBuffer {
++	return &logBuffer{
++		lines: make([]logLine, capacity),
++	}
++}
++
++func (b *logBuffer) push(line logLine) {
++	b.lines[b.head] = line
++	b.head = (b.head + 1) % len(b.lines)
++	if b.count < len(b.lines) {
++		b.count++
++	}
++}
++
++func (b *logBuffer) getAll() []logLine {
++	if b.count == 0 {
++		return nil
++	}
++	out := make([]logLine, b.count)
++	if b.count < len(b.lines) {
++		copy(out, b.lines[:b.count])
++	} else {
++		copy(out, b.lines[b.head:])
++		copy(out[len(b.lines)-b.head:], b.lines[:b.head])
++	}
++	return out
++}
++
+ // ── 模型 ─────────────────────────────────────────────────────────────────
+ 
+ const (
+@@ -99,7 +135,7 @@ type Model struct {
+ 	cfg *config.Config
+ 
+ 	statuses []*core.MailboxStatus
+-	logs     []logLine
++	logs     *logBuffer
+ 
+ 	selected  int  // 左侧面板中选中的邮箱索引
+ 	logOffset int  // 右侧面板中的滚动偏移
+@@ -115,6 +151,7 @@ func NewModel(bot *core.Bot, cfg *config.Config) Model {
+ 		bot:      bot,
+ 		cfg:      cfg,
+ 		statuses: bot.GetStatuses(),
++		logs:     newLogBuffer(maxLogLines),
+ 	}
+ }
+ 
+@@ -141,13 +178,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+ 		e := core.Event(msg)
+ 		switch e.Kind {
+ 		case core.EventLog:
+-			m.logs = append(m.logs, logLine{ts: e.Timestamp, msg: e.Message})
+-			if len(m.logs) > maxLogLines {
+-				m.logs = m.logs[len(m.logs)-maxLogLines:]
+-			}
++			m.logs.push(logLine{ts: e.Timestamp, msg: e.Message})
+ 			// 如果用户没有手动向上滚动，则自动滚动到底部。
+ 			vh := m.logViewHeight()
+-			maxOff := lenMax0(len(m.logs)-vh)
++			maxOff := lenMax0(m.logs.count - vh)
+ 			if m.logOffset >= maxOff-2 || m.logOffset == 0 {
+ 				m.logOffset = maxOff
+ 			}
+@@ -172,7 +206,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+ 
+ 	case "r", "R":
+ 		m.bot.TriggerPoll()
+-		m.logs = append(m.logs, logLine{
++		m.logs.push(logLine{
+ 			ts:  time.Now(),
+ 			msg: "🖱️  用户触发了手动轮询",
+ 		})
+@@ -194,11 +228,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+ 	case "pgup", "u":
+ 		m.logOffset = imax(0, m.logOffset-m.logViewHeight())
+ 	case "pgdn", "d":
+-		m.logOffset = imin(lenMax0(len(m.logs)-m.logViewHeight()), m.logOffset+m.logViewHeight())
++		m.logOffset = imin(lenMax0(m.logs.count-m.logViewHeight()), m.logOffset+m.logViewHeight())
+ 	case "g":
+ 		m.logOffset = 0
+ 	case "G":
+-		m.logOffset = lenMax0(len(m.logs) - m.logViewHeight())
++		m.logOffset = lenMax0(m.logs.count - m.logViewHeight())
+ 	}
+ 
+ 	return m, nil
+@@ -352,20 +386,22 @@ func (m Model) renderLogPanel(w, h int) string {
+ 		"",
+ 	}
+ 
++	allLogs := m.logs.getAll()
++
+ 	// 限制滚动偏移
+-	maxOff := lenMax0(len(m.logs) - vh)
++	maxOff := lenMax0(len(allLogs) - vh)
+ 	off := imin(m.logOffset, maxOff)
+ 	if off < 0 {
+ 		off = 0
+ 	}
+ 
+ 	end := off + vh
+-	if end > len(m.logs) {
+-		end = len(m.logs)
++	if end > len(allLogs) {
++		end = len(allLogs)
+ 	}
+-	visible := m.logs[off:end]
++	visible := allLogs[off:end]
+ 
+-	if len(m.logs) == 0 {
++	if len(allLogs) == 0 {
+ 		lines = append(lines, styleMeta.Render("  等待事件…"))
+ 	}
+ 
+@@ -376,8 +412,8 @@ func (m Model) renderLogPanel(w, h int) string {
+ 	}
+ 
+ 	// 滚动指示器
+-	if len(m.logs) > vh {
+-		total := len(m.logs)
++	if len(allLogs) > vh {
++		total := len(allLogs)
+ 		pct := 0
+ 		if maxOff > 0 {
+ 			pct = (off * 100) / maxOff

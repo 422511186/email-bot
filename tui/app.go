@@ -84,6 +84,42 @@ type logLine struct {
 	msg string
 }
 
+// ── 日志环形缓冲区 ───────────────────────────────────────────────────────
+
+type logBuffer struct {
+	lines []logLine
+	head  int
+	count int
+}
+
+func newLogBuffer(capacity int) *logBuffer {
+	return &logBuffer{
+		lines: make([]logLine, capacity),
+	}
+}
+
+func (b *logBuffer) push(line logLine) {
+	b.lines[b.head] = line
+	b.head = (b.head + 1) % len(b.lines)
+	if b.count < len(b.lines) {
+		b.count++
+	}
+}
+
+func (b *logBuffer) getAll() []logLine {
+	if b.count == 0 {
+		return nil
+	}
+	out := make([]logLine, b.count)
+	if b.count < len(b.lines) {
+		copy(out, b.lines[:b.count])
+	} else {
+		copy(out, b.lines[b.head:])
+		copy(out[len(b.lines)-b.head:], b.lines[:b.head])
+	}
+	return out
+}
+
 // ── 模型 ─────────────────────────────────────────────────────────────────
 
 const (
@@ -99,7 +135,7 @@ type Model struct {
 	cfg *config.Config
 
 	statuses []*core.MailboxStatus
-	logs     []logLine
+	logs     *logBuffer
 
 	selected  int  // 左侧面板中选中的邮箱索引
 	logOffset int  // 右侧面板中的滚动偏移
@@ -115,6 +151,7 @@ func NewModel(bot *core.Bot, cfg *config.Config) Model {
 		bot:      bot,
 		cfg:      cfg,
 		statuses: bot.GetStatuses(),
+		logs:     newLogBuffer(maxLogLines),
 	}
 }
 
@@ -141,13 +178,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		e := core.Event(msg)
 		switch e.Kind {
 		case core.EventLog:
-			m.logs = append(m.logs, logLine{ts: e.Timestamp, msg: e.Message})
-			if len(m.logs) > maxLogLines {
-				m.logs = m.logs[len(m.logs)-maxLogLines:]
-			}
+			m.logs.push(logLine{ts: e.Timestamp, msg: e.Message})
 			// 如果用户没有手动向上滚动，则自动滚动到底部。
 			vh := m.logViewHeight()
-			maxOff := lenMax0(len(m.logs)-vh)
+			maxOff := lenMax0(m.logs.count - vh)
 			if m.logOffset >= maxOff-2 || m.logOffset == 0 {
 				m.logOffset = maxOff
 			}
@@ -172,7 +206,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "r", "R":
 		m.bot.TriggerPoll()
-		m.logs = append(m.logs, logLine{
+		m.logs.push(logLine{
 			ts:  time.Now(),
 			msg: "🖱️  用户触发了手动轮询",
 		})
@@ -194,11 +228,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "pgup", "u":
 		m.logOffset = imax(0, m.logOffset-m.logViewHeight())
 	case "pgdn", "d":
-		m.logOffset = imin(lenMax0(len(m.logs)-m.logViewHeight()), m.logOffset+m.logViewHeight())
+		m.logOffset = imin(lenMax0(m.logs.count-m.logViewHeight()), m.logOffset+m.logViewHeight())
 	case "g":
 		m.logOffset = 0
 	case "G":
-		m.logOffset = lenMax0(len(m.logs) - m.logViewHeight())
+		m.logOffset = lenMax0(m.logs.count - m.logViewHeight())
 	}
 
 	return m, nil
@@ -271,7 +305,7 @@ func (m Model) renderBody() string {
 
 // renderMailboxPanel 渲染列出所有源账户的左侧面板。
 func (m Model) renderMailboxPanel(w, h int) string {
-	lines := []string{
+	listLines := []string{
 		stylePanelTitle.Render("邮箱列表"),
 		"",
 	}
@@ -299,40 +333,82 @@ func (m Model) renderMailboxPanel(w, h int) string {
 		}
 
 		iconLine = icon + " " + nameRendered
-		lines = append(lines, iconLine)
+		listLines = append(listLines, iconLine)
 
 		// 错误信息或上次轮询时间
 		if s.LastError != nil {
 			errStr := clipRune(s.LastError.Error(), w-3)
-			lines = append(lines, "  "+styleError.Render(errStr))
+			listLines = append(listLines, "  "+styleError.Render(errStr))
 		} else if !s.LastPoll.IsZero() {
-			lines = append(lines, "  "+styleMeta.Render(fmt.Sprintf(
+			listLines = append(listLines, "  "+styleMeta.Render(fmt.Sprintf(
 				"上次: %s   已转发: %d",
 				s.LastPoll.Format("15:04:05"),
 				s.TotalFwded,
 			)))
 		} else {
-			lines = append(lines, "  "+styleMeta.Render("等待首次轮询…"))
+			listLines = append(listLines, "  "+styleMeta.Render("等待首次轮询…"))
 		}
 
-		// 选中此邮箱时显示目标地址
-		if i == m.selected {
-			for _, src := range m.cfg.Sources {
-				if src.Username == s.Username {
-					lines = append(lines, "  "+styleMuted.Render(
-						fmt.Sprintf("→ 目标数: %d 个:", len(src.Targets)),
-					))
-					for _, t := range src.Targets {
-						lines = append(lines, "    "+stylePrimary.Render(clipRune(t, w-5)))
-					}
+		listLines = append(listLines, "")
+
+		// Keep the list compact: binding info is rendered in a dedicated section
+		// below using the otherwise empty panel space.
+		_ = i
+	}
+
+	// ── Binding info for the selected account ─────────────────────
+	detailLines := []string{}
+	if len(m.statuses) > 0 && m.selected >= 0 && m.selected < len(m.statuses) {
+		sel := m.statuses[m.selected]
+		// Find source config by username.
+		var src *config.SourceAccount
+		for i := range m.cfg.Sources {
+			if m.cfg.Sources[i].Username == sel.Username {
+				src = &m.cfg.Sources[i]
+				break
+			}
+		}
+		if src != nil {
+			detailLines = append(detailLines,
+				styleDivider.Render(strings.Repeat("─", imax(0, w))),
+				stylePanelTitle.Render("绑定信息"),
+				styleMeta.Render("账号: "+clipRune(src.Username, w)),
+				styleMeta.Render(fmt.Sprintf("IMAP: %s:%d", clipRune(src.Host, w), src.Port)),
+				styleMeta.Render("文件夹: "+clipRune(src.Mailbox, w)),
+				"",
+				styleMuted.Render(fmt.Sprintf("目标地址 (%d):", len(src.Targets))),
+			)
+			if len(src.Targets) == 0 {
+				detailLines = append(detailLines, styleMeta.Render("(未配置)"))
+			} else {
+				for _, t := range src.Targets {
+					detailLines = append(detailLines, "  "+stylePrimary.Render(clipRune(t, w-2)))
 				}
 			}
 		}
-
-		lines = append(lines, "")
 	}
 
-	// 填充至高度
+	// ── Layout: keep details visible, truncate list if necessary ──
+	const minListLines = 4
+	if h < 1 {
+		h = 1
+	}
+
+	// If detail section is too tall, trim it.
+	if len(detailLines) > imax(0, h-minListLines) {
+		detailLines = detailLines[:imax(0, h-minListLines)]
+	}
+	maxList := h - len(detailLines)
+	if maxList < 0 {
+		maxList = 0
+	}
+	if len(listLines) > maxList {
+		listLines = listLines[:maxList]
+	}
+
+	lines := append(listLines, detailLines...)
+
+	// Fill to height.
 	for len(lines) < h {
 		lines = append(lines, "")
 	}
@@ -352,20 +428,22 @@ func (m Model) renderLogPanel(w, h int) string {
 		"",
 	}
 
+	allLogs := m.logs.getAll()
+
 	// 限制滚动偏移
-	maxOff := lenMax0(len(m.logs) - vh)
+	maxOff := lenMax0(len(allLogs) - vh)
 	off := imin(m.logOffset, maxOff)
 	if off < 0 {
 		off = 0
 	}
 
 	end := off + vh
-	if end > len(m.logs) {
-		end = len(m.logs)
+	if end > len(allLogs) {
+		end = len(allLogs)
 	}
-	visible := m.logs[off:end]
+	visible := allLogs[off:end]
 
-	if len(m.logs) == 0 {
+	if len(allLogs) == 0 {
 		lines = append(lines, styleMeta.Render("  等待事件…"))
 	}
 
@@ -376,8 +454,8 @@ func (m Model) renderLogPanel(w, h int) string {
 	}
 
 	// 滚动指示器
-	if len(m.logs) > vh {
-		total := len(m.logs)
+	if len(allLogs) > vh {
+		total := len(allLogs)
 		pct := 0
 		if maxOff > 0 {
 			pct = (off * 100) / maxOff

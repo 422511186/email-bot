@@ -1,9 +1,10 @@
 package core
 
 import (
-	"bytes"
 	"fmt"
 	"io"
+	"net"
+	"strings"
 	"time"
 
 	"github.com/emersion/go-imap"
@@ -37,17 +38,36 @@ type FetchResult struct {
 func FetchNewEmails(src config.SourceAccount, lastUID uint32, initialized bool) (FetchResult, error) {
 	addr := fmt.Sprintf("%s:%d", src.Host, src.Port)
 
-	c, err := client.DialTLS(addr, nil)
+	dialer := &net.Dialer{Timeout: 30 * time.Second}
+	c, err := client.DialWithDialerTLS(dialer, addr, nil)
 	if err != nil {
 		return FetchResult{NewLastUID: lastUID}, fmt.Errorf("连接 %s: %w", addr, err)
 	}
 	defer func() { _ = c.Logout() }()
 
+	// 为所有后续的 IMAP 命令设置超时时间，防止因服务器假死导致整个 Goroutine 永久阻塞
+	c.Timeout = 30 * time.Second
+
 	if err := c.Login(src.Username, src.Password); err != nil {
 		return FetchResult{NewLastUID: lastUID}, fmt.Errorf("登录: %w", err)
 	}
 
+	// Some providers (e.g. NetEase 163/126) may require the client to send an
+	// IMAP ID command before selecting a mailbox, otherwise they may reply with
+	// "Unsafe Login".
+	trySendClientID(c, src.Host)
+
 	mbox, err := c.Select(src.Mailbox, true /* 只读 */)
+	if err != nil {
+		// Compatibility: NetEase sometimes rejects EXAMINE with "Unsafe Login".
+		// Fall back to SELECT once to verify.
+		if strings.Contains(err.Error(), "Unsafe Login") {
+			if m2, err2 := c.Select(src.Mailbox, false /* not read-only */); err2 == nil {
+				mbox = m2
+				err = nil
+			}
+		}
+	}
 	if err != nil {
 		return FetchResult{NewLastUID: lastUID}, fmt.Errorf("选择邮箱 %q: %w", src.Mailbox, err)
 	}
@@ -122,55 +142,69 @@ func searchUIDs(c *client.Client, lastUID uint32) ([]uint32, error) {
 }
 
 // fetchMessages 下载 uids 中每个 UID 对应邮件的 RFC-822 正文。
+// 增加了分页拉取，避免大批量邮件导致内存溢出。
 func fetchMessages(c *client.Client, uids []uint32, currentMax uint32) ([]FetchedEmail, uint32, error) {
-	seqset := new(imap.SeqSet)
-	for _, uid := range uids {
-		seqset.AddNum(uid)
-	}
-
-	section := &imap.BodySectionName{}
-	items := []imap.FetchItem{
-		imap.FetchUid,
-		imap.FetchEnvelope,
-		section.FetchItem(),
-	}
-
-	msgCh := make(chan *imap.Message, 16)
-	fetchErr := make(chan error, 1)
-	go func() {
-		fetchErr <- c.UidFetch(seqset, items, msgCh)
-	}()
-
 	var emails []FetchedEmail
 	maxUID := currentMax
+	const batchSize = 50 // 分页大小，每次最多拉取 50 封邮件
 
-	for msg := range msgCh {
-		if msg == nil {
-			continue
+	for i := 0; i < len(uids); i += batchSize {
+		end := i + batchSize
+		if end > len(uids) {
+			end = len(uids)
 		}
-		if msg.Uid > maxUID {
-			maxUID = msg.Uid
-		}
+		batchUIDs := uids[i:end]
 
-		body := msg.GetBody(section)
-		if body == nil {
-			continue
-		}
-		raw, err := io.ReadAll(body)
-		if err != nil {
-			continue
+		seqset := new(imap.SeqSet)
+		for _, uid := range batchUIDs {
+			seqset.AddNum(uid)
 		}
 
-		emails = append(emails, FetchedEmail{
-			UID:     msg.Uid,
-			Subject: envelopeSubject(msg),
-			From:    envelopeFrom(msg),
-			Date:    envelopeDate(msg),
-			Raw:     bytes.Clone(raw),
-		})
+		section := &imap.BodySectionName{}
+		items := []imap.FetchItem{
+			imap.FetchUid,
+			imap.FetchEnvelope,
+			section.FetchItem(),
+		}
+
+		msgCh := make(chan *imap.Message, 16)
+		fetchErr := make(chan error, 1)
+		go func() {
+			fetchErr <- c.UidFetch(seqset, items, msgCh)
+		}()
+
+		for msg := range msgCh {
+			if msg == nil {
+				continue
+			}
+			if msg.Uid > maxUID {
+				maxUID = msg.Uid
+			}
+
+			body := msg.GetBody(section)
+			if body == nil {
+				continue
+			}
+			raw, err := io.ReadAll(body)
+			if err != nil {
+				continue
+			}
+
+			emails = append(emails, FetchedEmail{
+				UID:     msg.Uid,
+				Subject: envelopeSubject(msg),
+				From:    envelopeFrom(msg),
+				Date:    envelopeDate(msg),
+				Raw:     raw,
+			})
+		}
+
+		if err := <-fetchErr; err != nil {
+			return emails, maxUID, err
+		}
 	}
 
-	return emails, maxUID, <-fetchErr
+	return emails, maxUID, nil
 }
 
 func envelopeSubject(msg *imap.Message) string {
@@ -185,6 +219,9 @@ func envelopeFrom(msg *imap.Message) string {
 		return ""
 	}
 	a := msg.Envelope.From[0]
+	if a == nil {
+		return ""
+	}
 	if a.PersonalName != "" {
 		return fmt.Sprintf("%s <%s@%s>", a.PersonalName, a.MailboxName, a.HostName)
 	}

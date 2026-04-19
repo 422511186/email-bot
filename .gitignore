@@ -1,0 +1,12 @@
+# Local Codex/agent workspace state
+.codex
+.codex/
+
+# Local runtime configuration (contains secrets)
+config.yaml
+config.yaml_bak
+
+# Build artifacts (do not commit)
+dist/
+email-bot
+email-bot.exe
